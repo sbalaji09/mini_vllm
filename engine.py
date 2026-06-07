@@ -23,6 +23,13 @@ def generate(prompt: str, max_new_tokens: int = 64):
     #   out.logits has shape [1, seq_len, vocab]; you want the LAST position.
     #   out.past_key_values IS your KV cache — keep it.
     #   Pick the next token (greedy = argmax). Record ttft here.
+    out = model(input_iids=input_ids, use_cache=True)
+    past_key_values = out.past_key_values
+
+    last_token = out.logis[:, -1, :].argmax(dim=-1, keepdim=True)
+    tfft = time.perf_count() - t0
+
+    generated.append(last_token.item())
 
     # --- DECODE LOOP ---
     # TODO: loop up to max_new_tokens:
