@@ -38,7 +38,17 @@ def generate(prompt: str, max_new_tokens: int = 64):
     #   break on tok.eos_token_id.
     #   (Notice: the redundant O(n^2) work would be here if you passed the
     #    full sequence instead of one token + the cache. Convince yourself why.)
+    for i in range(max_new_tokens-1):
+        if last_token.item() == tok.eos_token_id:
+            break
+    
+        out = model(input_ids=last_token, past_key_values=past_key_values, use_cache=True)
 
+        past_key_values = out.past_key_values
+        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated.append(next_token.item())
+    
+    
     dt = time.perf_counter() - t0
     text = tok.decode(generated)
     n = len(generated)
