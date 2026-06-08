@@ -1,0 +1,34 @@
+[
+  {
+    "batch_size": 1,
+    "ttft_s": 1.2333970423787832,
+    "latency_s": 2.0649287500418723,
+    "out_tokens": 10,
+    "throughput_tok_s": 4.842782105579779,
+    "per_seq_throughput": 4.842782105579779
+  },
+  {
+    "batch_size": 2,
+    "ttft_s": 0.305313291028142,
+    "latency_s": 1.8903034580871463,
+    "out_tokens": 19,
+    "throughput_tok_s": 10.05129621845302,
+    "per_seq_throughput": 5.02564810922651
+  },
+  {
+    "batch_size": 4,
+    "ttft_s": 0.4242819589562714,
+    "latency_s": 5.931484499946237,
+    "out_tokens": 73,
+    "throughput_tok_s": 12.307205725760841,
+    "per_seq_throughput": 3.0768014314402103
+  },
+  {
+    "batch_size": 8,
+    "ttft_s": 0.8868922078981996,
+    "latency_s": 6.514913666062057,
+    "out_tokens": 201,
+    "throughput_tok_s": 30.852289117362098,
+    "per_seq_throughput": 3.856536139670262
+  }
+]
