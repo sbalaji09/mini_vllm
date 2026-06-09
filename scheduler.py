@@ -107,3 +107,18 @@ class ContinuousBatchingEngine:
 
         # replace the old running list with only the requests that need more tokens
         self.running = new_running
+
+    # this helper removes finished requests from the active running list
+    def _retire(self):
+        # empty list for requests that aren't done yet
+        still_running = []
+        
+        for r in self.running:
+            # if the request is finished, then add it to the completed list and set its completed time
+            if r.finished:
+                r.t_done = time.perf_counter()
+                self.completed.append(r)
+            # otherwise, add it to the still_running list
+            else:
+                still_running.append(r)
+        self.running = still_running
