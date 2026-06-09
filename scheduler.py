@@ -32,7 +32,18 @@ class ContinuousBatchingEngine:
         self.running = [] # list of the actively running processes
         self.completed = []
         self._ids = itertools.count()
-    
+        # timing instrumentation (seconds): where does wall-clock actually go?
+        self.t_prefill = 0.0      # per-request prefill forwards in _admit
+        self.t_decode_fwd = 0.0   # the batched decode model() forward
+        self.t_cache_mgmt = 0.0   # pad/cat/extract churn around the forward
+
+    def _sync(self):
+        # GPU kernels are async, so a bare timer around model() would measure
+        # only kernel-launch time. Sync so timers reflect real execution.
+        # No-op on CPU.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     # submit function takes in a prompt and max_new_tokens, turns it into
     # a Request object and adds it to the waiting queue
     def submit(self, prompt: str, max_new_tokens: int = 64) -> Request:
@@ -58,7 +69,9 @@ class ContinuousBatchingEngine:
             # transformers version, not a bare tensor, so go through tok(...).
             text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
             input_ids = tok(text, return_tensors="pt")["input_ids"].to(DEVICE)
+            self._sync(); _t = time.perf_counter()
             out = model(input_ids=input_ids, use_cache=True)
+            self._sync(); self.t_prefill += time.perf_counter() - _t
 
             # store the KV cache, the most likely output token, and record the requests length
             r.past_key_values = out.past_key_values
@@ -147,6 +160,8 @@ class ContinuousBatchingEngine:
         batch = self.running
         input_ids = torch.cat([r.last_token for r in batch], dim=0)
 
+        # --- CACHE MGMT: build the batched (left-padded) cache + masks (timed) ---
+        self._sync(); _t = time.perf_counter()
         # _batch_caches now returns a ready DynamicCache (5.x API)
         past, max_cache_len = self._batch_caches(batch)
 
@@ -168,8 +183,10 @@ class ContinuousBatchingEngine:
         for i, r in enumerate(batch):
             attention_mask[i, max_cache_len - r.cur_len:] = 1
             position_ids[i, 0] = r.cur_len
-        
-        # runs one model forward pass for the entire active batch
+        self._sync(); self.t_cache_mgmt += time.perf_counter() - _t
+
+        # --- DECODE FORWARD: one model() pass for the whole active batch (timed) ---
+        self._sync(); _t = time.perf_counter()
         out=model(
             input_ids=input_ids,
             past_key_values=past,
@@ -177,10 +194,12 @@ class ContinuousBatchingEngine:
             position_ids=position_ids,
             use_cache=True,
         )
-
         # gets the model's next-token prediction for each request
         next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        self._sync(); self.t_decode_fwd += time.perf_counter() - _t
 
+        # --- CACHE MGMT: scatter outputs + extract each request's cache (timed) ---
+        self._sync(); _t = time.perf_counter()
         # loops through each request to scatter the batched outputs back into individual request state
         for i, r in enumerate(batch):
             # adds the new generated token to the request and updates values accordingly
@@ -193,6 +212,7 @@ class ContinuousBatchingEngine:
 
             if token_id == tok.eos_token_id or len(r.output_ids) >= r.max_new_tokens:
                 r.finished = True
+        self._sync(); self.t_cache_mgmt += time.perf_counter() - _t
 
     # this helper removes finished requests from the active running list
     def _retire(self):

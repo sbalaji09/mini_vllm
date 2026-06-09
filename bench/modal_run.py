@@ -61,6 +61,7 @@ def run_bench(n: int, b: int, cap: int):
     print(f"\nworkload={n} reqs, capacity B={b}, max_new_tokens={cap}\n")
     ab.print_row(stat)
     ab.print_row(cont)
+    ab.print_breakdown(cont)
     if cont["throughput_tok_s"] and stat["throughput_tok_s"]:
         ratio = cont["throughput_tok_s"] / stat["throughput_tok_s"]
         print(f"\ncontinuous / static throughput = {ratio:.2f}x")

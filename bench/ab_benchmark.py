@@ -98,7 +98,12 @@ def bench_continuous(prompts, B, cap):
     ttfts = [r.t_first - r.t_arrival for r in completed]
     lats = [r.t_done - r.t_arrival for r in completed]
     total = sum(len(r.output_ids) for r in completed)
-    return summarize("continuous", ttfts, lats, total, wall, _peak_mem())
+    s = summarize("continuous", ttfts, lats, total, wall, _peak_mem())
+    # timing breakdown: where did the wall-clock actually go?
+    s["t_prefill"] = round(eng.t_prefill, 3)
+    s["t_decode_fwd"] = round(eng.t_decode_fwd, 3)
+    s["t_cache_mgmt"] = round(eng.t_cache_mgmt, 3)
+    return s
 
 
 def bench_chunked_static(prompts, B, cap):
@@ -131,6 +136,19 @@ def print_row(s):
           f"peakMB {s['peak_mem_mb']}")
 
 
+def print_breakdown(s):
+    # only the continuous summary carries the timing breakdown
+    tp, td, tc = s.get("t_prefill"), s.get("t_decode_fwd"), s.get("t_cache_mgmt")
+    if tp is None:
+        return
+    tot = tp + td + tc
+    pct = (lambda x: f"{100 * x / tot:.0f}%") if tot else (lambda x: "n/a")
+    print(f"    where continuous spent its time: "
+          f"prefill {tp}s ({pct(tp)}) | "
+          f"decode_fwd {td}s ({pct(td)}) | "
+          f"cache_mgmt {tc}s ({pct(tc)})")
+
+
 if __name__ == "__main__":
     N = 8        # bump to 100+ on GPU for stable P99
     B = 4        # capacity (max concurrent sequences) -- SAME for both systems
@@ -144,6 +162,7 @@ if __name__ == "__main__":
     print(f"\nworkload={N} reqs, capacity B={B}, max_new_tokens={CAP}\n")
     print_row(stat)
     print_row(cont)
+    print_breakdown(cont)
 
     if cont["throughput_tok_s"] and stat["throughput_tok_s"]:
         x = cont["throughput_tok_s"] / stat["throughput_tok_s"]
