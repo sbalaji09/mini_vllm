@@ -107,19 +107,15 @@ class ContinuousBatchingEngine:
         # replace the old running list with only the requests that need more tokens
         self.running = new_running
     
-    # helper that makes the KV cache format easier to work with
-    def _to_legacy(self, past_key_values):
-        if hasattr(past_key_values, "to_legacy_cache"):
-            return past_key_values.to_legacy_cache()
-        return past_key_values
-    
-    # helper that pads one request's kV cache to a desired sequence length
-    def _pad_one_cache(self, past, target_len: int):
-        legacy = self._to_legacy(past)
+    # helper that pads one request's KV cache to a desired sequence length.
+    # transformers 5.x: a DynamicCache exposes per-layer tensors via
+    # cache.layers[i].keys / .values  (shape [B, n_kv_heads, seq, head_dim]).
+    def _pad_one_cache(self, cache, target_len: int):
         padded = []
 
-        # pulls out the key and value from the KV cache
-        for key, value in legacy:
+        # pulls out the key and value tensors from each layer of the KV cache
+        for layer in cache.layers:
+            key, value = layer.keys, layer.values
             pad_len = target_len - key.shape[-2]
 
             # if there is something to pad, then pad it by adding zeros and concatenating
@@ -129,12 +125,12 @@ class ContinuousBatchingEngine:
 
                 key = torch.cat([kp, key], dim=-2)
                 value = torch.cat([vp, value], dim=-2)
-            
-            padded.append((key, value))
-        
-        return tuple(padded)
 
-    # turns many per-request KV caches into one batched KV cache
+            padded.append((key, value))
+
+        return padded
+
+    # turns many per-request KV caches into one batched DynamicCache
     def _batch_caches(self, requests):
         max_len = max(r.cur_len for r in requests)
 
@@ -144,28 +140,29 @@ class ContinuousBatchingEngine:
             for r in requests
         ]
 
-        batched = []
-
-        # for every transformer layer, we stack all the key and value tensors and then return it
+        # build a fresh DynamicCache: for each layer, stack all requests' key
+        # and value tensors along the batch dim and register them in order.
+        cache = DynamicCache()
         for layer_idx in range(len(padded[0])):
-            keys = torch.cat([cache[layer_idx][0] for cache in padded], dim=0)
-            values = torch.cat([cache[layer_idx][1] for cache in padded], dim=0)
-            batched.append((keys, values))
+            keys = torch.cat([p[layer_idx][0] for p in padded], dim=0)
+            values = torch.cat([p[layer_idx][1] for p in padded], dim=0)
+            cache.update(keys, values, layer_idx)
 
-        return tuple(batched), max_len
+        return cache, max_len
 
-    # pulls one request's KC cache back out of the batched output cache
-    def _extract_one_cache(self, past_key_values, batch_idx: int, keep_len: int):
-        one = []
+    # pulls one request's KV cache back out of the batched output cache,
+    # returning a fresh single-sequence DynamicCache (pad dropped via -keep_len:)
+    def _extract_one_cache(self, cache, batch_idx: int, keep_len: int):
+        one = DynamicCache()
 
-        # loops through every layer in the model output cache
-        # batches the key and value and appends it to the output cache
-        for key, value in self._to_legacy(past_key_values):
-            key_i = key[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
-            value_i = value[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
-            one.append((key_i, value_i))
+        # loops through every layer in the model output cache, slicing out this
+        # request's row and its real (un-padded) tail of length keep_len
+        for layer_idx, layer in enumerate(cache.layers):
+            key_i = layer.keys[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
+            value_i = layer.values[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
+            one.update(key_i, value_i, layer_idx)
 
-        return tuple(one)
+        return one
     
     # defines one batched decode step for all requests
     def _decode_step_batched(self):
@@ -176,9 +173,8 @@ class ContinuousBatchingEngine:
         batch = self.running
         input_ids = torch.cat([r.last_token for r in batch], dim=0)
 
-        batched_past_key_values, max_cache_len = self._batch_caches(batch)
-        # wrap the legacy tuple back into a Cache object so model() accepts it
-        past = DynamicCache.from_legacy_cache(batched_past_key_values)
+        # _batch_caches now returns a ready DynamicCache (5.x API)
+        past, max_cache_len = self._batch_caches(batch)
 
         # creates a batched attention mask with the shape [B, max_cache_len + 1]
         attention_mask = torch.zeros(
