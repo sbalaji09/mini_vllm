@@ -180,6 +180,73 @@ class ContinuousBatchingEngine:
 
         return one
     
+    @torch.no_grad()
+    def _decode_step(self):
+        if not self.running:
+            return
+
+        R = len(self.running)
+        L = max(r.cur_len for r in self.running)
+        input_ids = torch.cat([r.last_token for r in self.running], dim=0)
+
+        self._sync()
+        _t = time.perf_counter()
+
+        attention_mask = torch.zeros(
+            (R, L + 1),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+
+        position_ids = torch.empty(
+            (R, 1),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+
+        for i, r in enumerate(self.running):
+            attention_mask[i, -(r.cur_len + 1):] = 1
+            position_ids[i, 0] = r.cur_len
+
+        self._sync()
+        self.t_cache_mgmt += time.perf_counter() - _t
+
+        self._sync()
+        _t = time.perf_counter()
+
+        out = model(
+            input_ids=input_ids,
+            past_key_values=self.cache,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+
+        next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+        self._sync()
+        self.t_decode_fwd += time.perf_counter() - _t
+
+        self.cache = out.past_key_values
+
+        self._sync()
+        _t = time.perf_counter()
+
+        eos_hits = next_tokens.squeeze(1) == tok.eos_token_id
+        ids = next_tokens.squeeze(1).tolist()
+        eos = eos_hits.tolist()
+
+        for i, r in enumerate(self.running):
+            r.output_ids.append(ids[i])
+            r.last_token = next_tokens[i:i + 1]
+            r.cur_len += 1
+
+            if eos[i] or len(r.output_ids) >= r.max_new_tokens:
+                r.finished = True
+
+        self._sync()
+        self.t_cache_mgmt += time.perf_counter() - _t
+
     # defines one batched decode step for all requests
     @torch.no_grad()
     def _decode_step_batched(self):
