@@ -101,6 +101,56 @@ class ContinuousBatchingEngine:
 
         # replace the old running list with only the requests that need more tokens
         self.running = new_running
+    
+    def _decode_step_batched(self):
+        if not self.running:
+            return
+        
+        batch = self.running
+        input_ids = torch.cat([r.last_token for r in batch], dim=0)
+
+        batched_past_key_values, max_cache_len = self._batch_caches(batch)
+
+        attention_mask = torch.zeros(
+            (len(batch), max_cache_len + 1),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+
+        position_ids = torch.empty(
+            (len(batch), 1),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+
+        for i, r in enumerate(batch):
+            attention_mask[i, max_cache_len - r.cur_len:] = 1
+            position_ids[i, 0] = r.cur_len
+        
+        out=model(
+            input_ids=input_ids,
+            past_key_values=batched_past_key_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+
+        next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+        for i, r in enumerate(batch):
+            token_id = next_tokens[i].item()
+
+            r.output_ids.append(token_id)
+            r.last_token = next_tokens[i:i+1]
+            r.cur_len += 1
+            r.past_key_values = extract_one_cache(
+                out.past_key_values, 
+                i,
+                r.cur_len,
+            )
+
+            if token_id == tok.eos_token_id or len(r.output_ids) >= r.max_new_tokens:
+                r.finished = True
 
     # this helper removes finished requests from the active running list
     def _retire(self):
