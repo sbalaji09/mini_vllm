@@ -131,3 +131,25 @@ class ContinuousBatchingEngine:
         while self.waiting or self.running:
             self.step()
         return self.completed
+
+if __name__ == "__main__":
+    engine = ContinuousBatchingEngine(max_batch_size=2)
+
+    requests = [
+        engine.submit("Explain KV cache in one sentence.", max_new_tokens=32),
+        engine.submit("What is continuous batching?", max_new_tokens=32),
+        engine.submit("Name three benefits of batching.", max_new_tokens=32),
+        engine.submit("Explain token decoding briefly.", max_new_tokens=32),
+    ]
+
+    completed = engine.run()
+
+    for r in completed:
+        text = tok.decode(r.output_ids, skip_special_tokens=True)
+        print(f"\nRequest {r.id}")
+        print(text)
+        print({
+            "tokens": len(r.output_ids),
+            "ttft_s": r.t_first - r.t_arrival if r.t_first else None,
+            "latency_s": r.t_done - r.t_arrival if r.t_done else None,
+        })
