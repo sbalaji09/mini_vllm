@@ -16,9 +16,12 @@ model.eval()
 
 @torch.no_grad()
 def generate(prompt: str, max_new_tokens: int = 64):
-    # wraps the prompt in a specific format so that Qwen can actually run it
+    # wraps the prompt in a specific format so that Qwen can actually run it.
+    # apply_chat_template(..., return_tensors=) returns a BatchEncoding in
+    # transformers 5.x, not a bare tensor, so render to text then tokenize.
     msgs = [{"role": "user", "content": prompt}]
-    input_ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
+    text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+    input_ids = tok(text, return_tensors="pt")["input_ids"]
 
     t0 = time.perf_counter()
     ttft = None
