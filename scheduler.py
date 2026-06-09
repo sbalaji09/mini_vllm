@@ -16,7 +16,6 @@ class Request:
     id: int
     prompt: str
     max_new_tokens: int = 64
-    past_key_values: object = None
     last_token: torch.Tensor = None
     cur_len: int = 0
     output_ids: list = field(default_factory=list)
@@ -32,6 +31,7 @@ class ContinuousBatchingEngine:
         self.running = [] # list of the actively running processes
         self.completed = []
         self._ids = itertools.count()
+        self.cache = None
         # timing instrumentation (seconds): where does wall-clock actually go?
         self.t_prefill = 0.0      # per-request prefill forwards in _admit
         self.t_decode_fwd = 0.0   # the batched decode model() forward
@@ -74,7 +74,7 @@ class ContinuousBatchingEngine:
             self._sync(); self.t_prefill += time.perf_counter() - _t
 
             # store the KV cache, the most likely output token, and record the requests length
-            r.past_key_values = out.past_key_values
+            new_cache = out.past_key_values
             r.last_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             r.cur_len = input_ids.shape[-1]
 
@@ -90,8 +90,38 @@ class ContinuousBatchingEngine:
                 r.finished = True
                 r.t_done = time.perf_counter()
                 self.completed.append(r)
+            
+            self._sync()
+            _t = time.perf_counter()
+            if self.cache is None:
+                self.cache = new_cache
+                self.running = [r]
             else:
-                self.running.append(r)
+                L = self.cache.layers[0].keys.shape[-2]
+                p = new_cache.layers[0].keys.shape[-2]
+                Lp = max(L, p)
+
+                old_layers = self._pad_one_cache(self.cache, Lp)
+                new_layers = self._pad_one_cache(new_cache, Lp)
+
+                merged = DynamicCache()
+                
+                for layer_idx in range(len(old_layers)):
+                    old_k, old_v = old_layers[layer_idx]
+                    new_k, new_v = new_layers[layer_idx]
+
+                    keys = torch.cat([old_k, new_k], dim=0)
+                    values = torch.cat([old_v, new_v], dim=0)
+
+                    merged.update(keys, values, layer_idx)
+                
+                self.cache = merged
+            
+            self.running.append(r)
+            
+            self._sync()
+            self.t_cache_mgmt += time.perf_counter() - _t
+
 
     # helper that pads one request's KV cache to a desired sequence length.
     # transformers 5.x: a DynamicCache exposes per-layer tensors via
