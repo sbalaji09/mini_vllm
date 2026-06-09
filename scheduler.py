@@ -311,20 +311,44 @@ class ContinuousBatchingEngine:
                 r.finished = True
         self._sync(); self.t_cache_mgmt += time.perf_counter() - _t
 
-    # this helper removes finished requests from the active running list
+    @torch.no_grad()
     def _retire(self):
-        # empty list for requests that aren't done yet
-        still_running = []
+        if not self.running:
+            return
 
-        for r in self.running:
-            # if the request is finished, then add it to the completed list and set its completed time
-            if r.finished:
-                r.t_done = time.perf_counter()
-                self.completed.append(r)
-            # otherwise, add it to the still_running list
-            else:
-                still_running.append(r)
-        self.running = still_running
+        keep = [i for i, r in enumerate(self.running) if not r.finished]
+
+        for r in (x for x in self.running if x.finished):
+            r.t_done = time.perf_counter()
+            self.completed.append(r)
+
+        if len(keep) == len(self.running):
+            return
+
+        self._sync()
+        _t = time.perf_counter()
+
+        if not keep:
+            self.cache = None
+            self.running = []
+            self._sync()
+            self.t_cache_mgmt += time.perf_counter() - _t
+            return
+
+        new_max = max(self.running[i].cur_len for i in keep)
+
+        new_cache = DynamicCache()
+
+        for layer_idx, layer in enumerate(self.cache.layers):
+            keys = layer.keys[keep, :, -new_max:, :].contiguous()
+            values = layer.values[keep, :, -new_max:, :].contiguous()
+            new_cache.update(keys, values, layer_idx)
+
+        self.cache = new_cache
+        self.running = [self.running[i] for i in keep]
+
+        self._sync()
+        self.t_cache_mgmt += time.perf_counter() - _t
     
     # defines one scheduler iteration
     def step(self):
