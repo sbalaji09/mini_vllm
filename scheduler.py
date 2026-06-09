@@ -23,3 +23,11 @@ class Request:
     t_arrival: float = 0.0
     t_first: float = None
     t_done: float = None
+
+class ContinuousBatchingEngine:
+    def __init__(self, max_batch_size: int = 8):
+        self.max_batch_size = max_batch_size
+        self.waiting = [] # FIFO queue of the requests that are waiting to run
+        self.running = [] # list of the actively running processes
+        self.completed = []
+        self._ids = itertools.count()
