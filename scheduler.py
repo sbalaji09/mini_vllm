@@ -107,10 +107,10 @@ class ContinuousBatchingEngine:
             return past_key_values.to_legacy_cache()
         return past_key_values
     
-    def pad_one_cache(self, past_key_values, target_len: int):
+    def pad_one_cache(self, past, target_len: int):
         legacy = self._to_legacy(past)
         padded = []
-        for key, value in past_key_values:
+        for key, value in legacy:
             pad_len = target_len - key.shape[-2]
 
             if pad_len > 0:
@@ -193,7 +193,7 @@ class ContinuousBatchingEngine:
             r.last_token = next_tokens[i:i+1]
             r.cur_len += 1
             r.past_key_values = self._extract_one_cache(out.past_key_values, i, r.cur_len)
-            
+
             if token_id == tok.eos_token_id or len(r.output_ids) >= r.max_new_tokens:
                 r.finished = True
 
@@ -217,7 +217,7 @@ class ContinuousBatchingEngine:
         # moves new requests into running. does the prefill pass for newly admitted 
         # requests and moves finished requets out of running
         self._admit()
-        self._decode_step()
+        self._decode_step_batched()
         self._retire()
 
     # defines the full scheduler loop
