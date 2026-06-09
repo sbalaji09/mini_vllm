@@ -52,7 +52,11 @@ class ContinuousBatchingEngine:
             # format the user prompt as a chat prompt so Qwen can intake it
             # then tokenize it into model input IDs
             msgs = [{"role": "user", "content": r.prompt}]
-            input_ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
+            # render template -> string, then tokenize. apply_chat_template with
+            # return_tensors returns a BatchEncoding (dict-like) in this
+            # transformers version, not a bare tensor, so go through tok(...).
+            text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+            input_ids = tok(text, return_tensors="pt")["input_ids"]
             out = model(input_ids=input_ids, use_cache=True)
 
             # store the KV cache, the most likely output token, and record the requests length
