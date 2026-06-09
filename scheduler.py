@@ -6,6 +6,7 @@ for the forward pass
 import time, itertools
 from dataclasses import dataclass, field
 import torch
+from transformers import DynamicCache
 from engine import model, tok
 
 # request dataclass with essential information about request including:
@@ -103,13 +104,13 @@ class ContinuousBatchingEngine:
         self.running = new_running
     
     # helper that makes the KV cache format easier to work with
-    def as_legacy_cache(self, past_key_values):
+    def _to_legacy(self, past_key_values):
         if hasattr(past_key_values, "to_legacy_cache"):
             return past_key_values.to_legacy_cache()
         return past_key_values
     
     # helper that pads one request's kV cache to a desired sequence length
-    def pad_one_cache(self, past, target_len: int):
+    def _pad_one_cache(self, past, target_len: int):
         legacy = self._to_legacy(past)
         padded = []
 
@@ -155,7 +156,7 @@ class ContinuousBatchingEngine:
 
         # loops through every layer in the model output cache
         # batches the key and value and appends it to the output cache
-        for key, value in self._as_legacy_cache(past_key_values):
+        for key, value in self._to_legacy(past_key_values):
             key_i = key[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
             value_i = value[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
             one.append((key_i, value_i))
@@ -172,6 +173,8 @@ class ContinuousBatchingEngine:
         input_ids = torch.cat([r.last_token for r in batch], dim=0)
 
         batched_past_key_values, max_cache_len = self._batch_caches(batch)
+        # wrap the legacy tuple back into a Cache object so model() accepts it
+        past = DynamicCache.from_legacy_cache(batched_past_key_values)
 
         # creates a batched attention mask with the shape [B, max_cache_len + 1]
         attention_mask = torch.zeros(
@@ -195,7 +198,7 @@ class ContinuousBatchingEngine:
         # runs one model forward pass for the entire active batch
         out=model(
             input_ids=input_ids,
-            past_key_values=batched_past_key_values,
+            past_key_values=past,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=True,
