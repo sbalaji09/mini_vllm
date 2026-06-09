@@ -68,8 +68,6 @@ class ContinuousBatchingEngine:
             # otherwise, append it to running since it still needs to process
             if r.last_token[0].item() == tok.eos_token_id:
                 r.finished = True
-                r.t_done = time.perf_counter()
-                self.completed.append(r)
             else:
                 self.running.append(r)
 
