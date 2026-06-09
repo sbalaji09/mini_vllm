@@ -41,21 +41,31 @@ class ContinuousBatchingEngine:
         self.waiting.append(r)
         return r
     
+    # moves requests from the waiting queue into active execution
     def _admit(self):
+        # keep admitting requests while ther eis room in the running set
         while len(self.running) < self.max_batch_size and self.waiting:
+            # take the oldest waiting request
             r = self.waiting.pop(0)
 
+            # format the user prompt as a chat prompt so Qwen can intake it
+            # then tokenize it into model input IDs
             msgs = [{"role": "user", "content": r.prompt}]
             input_ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
             out = model(input_ids=input_ids, use_cache=True)
 
+            # store the KV cache, the most likely output token, and record the requests length
             r.past_key_values = out.past_key_values
             r.last_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             r.cur_len = input_ids.shape[-1]
 
+            # save the first generated token ID for the request and record when the first generated
+            # token became available
             r.output_ids.append(r.last_token[0].item())
             r.t_first = time.perf_counter()
 
+            # if the last token is eos, then mark it as completed
+            # otherwise, append it to running since it still needs to process
             if r.last_token[0].item() == tok.eos_token_id:
                 r.finished = True
                 r.t_done = time.perf_counter()
