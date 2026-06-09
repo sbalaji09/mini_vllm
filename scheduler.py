@@ -43,6 +43,7 @@ class ContinuousBatchingEngine:
         return r
     
     # moves requests from the waiting queue into active execution
+    @torch.no_grad()
     def _admit(self):
         # keep admitting requests while ther eis room in the running set
         while len(self.running) < self.max_batch_size and self.waiting:
@@ -137,6 +138,7 @@ class ContinuousBatchingEngine:
         return one
     
     # defines one batched decode step for all requests
+    @torch.no_grad()
     def _decode_step_batched(self):
         if not self.running:
             return
