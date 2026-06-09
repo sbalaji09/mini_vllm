@@ -31,3 +31,14 @@ class ContinuousBatchingEngine:
         self.running = [] # list of the actively running processes
         self.completed = []
         self._ids = itertools.count()
+    
+    # submit function takes in a prompt and max_new_tokens, turns it into
+    # a Request object and adds it to the waiting queue
+    def submit(self, prompt: str, max_new_tokens: int = 64) -> Request:
+        r = Request(id=next(self._ids), prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    t_arrival=time.perf_counter())
+        self.waiting.append(r)
+        return r
+    
+    
