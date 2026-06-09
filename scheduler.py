@@ -102,17 +102,22 @@ class ContinuousBatchingEngine:
         # replace the old running list with only the requests that need more tokens
         self.running = new_running
     
+    # helper that makes the KV cache format easier to work with
     def as_legacy_cache(self, past_key_values):
         if hasattr(past_key_values, "to_legacy_cache"):
             return past_key_values.to_legacy_cache()
         return past_key_values
     
+    # helper that pads one request's kV cache to a desired sequence length
     def pad_one_cache(self, past, target_len: int):
         legacy = self._to_legacy(past)
         padded = []
+
+        # pulls out the key and value from the KV cache
         for key, value in legacy:
             pad_len = target_len - key.shape[-2]
 
+            # if there is something to pad, then pad it by adding zeros and concatenating
             if pad_len > 0:
                 kp = key.new_zeros(*key.shape[:-2], pad_len, key.shape[-1])
                 vp = value.new_zeros(*value.shape[:-2], pad_len, value.shape[-1])
@@ -124,9 +129,11 @@ class ContinuousBatchingEngine:
         
         return tuple(padded)
 
+    # turns many per-request KV caches into one batched KV cache
     def _batch_caches(self, requests):
         max_len = max(r.cur_len for r in requests)
 
+        # pads each request based on the longest request
         padded = [
             self._pad_one_cache(r.past_key_values, max_len)
             for r in requests
@@ -134,6 +141,7 @@ class ContinuousBatchingEngine:
 
         batched = []
 
+        # for every transformer layer, we stack all the key and value tensors and then return it
         for layer_idx in range(len(padded[0])):
             keys = torch.cat([cache[layer_idx][0] for cache in padded], dim=0)
             values = torch.cat([cache[layer_idx][1] for cache in padded], dim=0)
@@ -141,9 +149,12 @@ class ContinuousBatchingEngine:
 
         return tuple(batched), max_len
 
+    # pulls one request's KC cache back out of the batched output cache
     def _extract_one_cache(self, past_key_values, batch_idx: int, keep_len: int):
         one = []
 
+        # loops through every layer in the model output cache
+        # batches the key and value and appends it to the output cache
         for key, value in self._as_legacy_cache(past_key_values):
             key_i = key[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
             value_i = value[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
