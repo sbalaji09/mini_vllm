@@ -108,20 +108,48 @@ class ContinuousBatchingEngine:
         return past_key_values
     
     def pad_one_cache(self, past_key_values, target_len: int):
+        legacy = self._to_legacy(past)
         padded = []
         for key, value in past_key_values:
             pad_len = target_len - key.shape[-2]
 
             if pad_len > 0:
-                key_pad = key.new_zeros(*key.shape[:-2], pad_len, key.shape[-1])
-                value_pad = value.new_zeros(*value.shape[:-2], pad_len, value.shape[-1])
+                kp = key.new_zeros(*key.shape[:-2], pad_len, key.shape[-1])
+                vp = value.new_zeros(*value.shape[:-2], pad_len, value.shape[-1])
 
-                key = torch.cat([key_pad, key], dim=-2)
-                value = torch.cat([value_pad, value], dim=-2)
+                key = torch.cat([kp, key], dim=-2)
+                value = torch.cat([vp, value], dim=-2)
             
             padded.append((key, value))
         
         return tuple(padded)
+
+    def _batch_caches(self, requests):
+        max_len = max(r.cur_len for r in requests)
+
+        padded = [
+            self._pad_one_cache(r.past_key_values, max_len)
+            for r in requests
+        ]
+
+        batched = []
+
+        for layer_idx in range(len(padded[0])):
+            keys = torch.cat([cache[layer_idx][0] for cache in padded], dim=0)
+            values = torch.cat([cache[layer_idx][1] for cache in padded], dim=0)
+            batched.append((keys, values))
+
+        return tuple(batched), max_len
+
+    def _extract_one_cache(self, past_key_values, batch_idx: int, keep_len: int):
+        one = []
+
+        for key, value in self._as_legacy_cache(past_key_values):
+            key_i = key[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
+            value_i = value[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
+            one.append((key_i, value_i))
+
+        return tuple(one)
     
     def _decode_step_batched(self):
         if not self.running:
@@ -164,12 +192,8 @@ class ContinuousBatchingEngine:
             r.output_ids.append(token_id)
             r.last_token = next_tokens[i:i+1]
             r.cur_len += 1
-            r.past_key_values = extract_one_cache(
-                out.past_key_values, 
-                i,
-                r.cur_len,
-            )
-
+            r.past_key_values = self._extract_one_cache(out.past_key_values, i, r.cur_len)
+            
             if token_id == tok.eos_token_id or len(r.output_ids) >= r.max_new_tokens:
                 r.finished = True
 
