@@ -69,44 +69,16 @@ class ContinuousBatchingEngine:
             r.output_ids.append(r.last_token[0].item())
             r.t_first = time.perf_counter()
 
-            # if the last token is eos, then mark it as completed
-            # otherwise, append it to running since it still needs to process
+            # if the first token is already eos, the request finished during
+            # prefill: send it straight to completed (with t_done) so it isn't
+            # silently dropped. otherwise keep it running.
             if r.last_token[0].item() == tok.eos_token_id:
                 r.finished = True
+                r.t_done = time.perf_counter()
+                self.completed.append(r)
             else:
                 self.running.append(r)
 
-    # this defines one decoding step for all the currently running requests
-    def _decode_step(self):
-        # this is a fresh list for requests that are still not finished
-        new_running = []
-
-        # loops through every request that was active before this step
-        for r in self.running:
-            # run the model on the most recent token for this request
-            out = model(input_ids=r.last_token, past_key_values=r.past_key_values, use_cache=True)
-            
-            # takes the model's prediction for the next token and picks the highest-probability token
-            # then updates the output_ids and KV cache based on the new tokens
-            last_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            r.output_ids.append(last_token[0].item())
-            r.past_key_values = out.past_key_values
-
-            # saves the newly generated token and increments current sequence length
-            r.last_token = last_token
-            r.cur_len += 1
-
-            # checks whether the request should stop: hit eos or we have generated the maximum allowed number of tokens
-            if (last_token[0].item() == tok.eos_token_id) or (len(r.output_ids) >= r.max_new_tokens):
-                # mark the request as finished and set the metric times
-                r.finished = True
-            # if the request is not done yet, keep it active
-            else:
-                new_running.append(r)
-
-        # replace the old running list with only the requests that need more tokens
-        self.running = new_running
-    
     # helper that pads one request's KV cache to a desired sequence length.
     # transformers 5.x: a DynamicCache exposes per-layer tensors via
     # cache.layers[i].keys / .values  (shape [B, n_kv_heads, seq, head_dim]).
