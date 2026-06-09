@@ -7,7 +7,7 @@ import time, itertools
 from dataclasses import dataclass, field
 import torch
 from transformers import DynamicCache
-from engine import model, tok
+from engine import model, tok, DEVICE
 
 # request dataclass with essential information about request including:
 # id, prompt, max_new_tokens, KV cache, last_token, and metrics
@@ -56,7 +56,7 @@ class ContinuousBatchingEngine:
             # return_tensors returns a BatchEncoding (dict-like) in this
             # transformers version, not a bare tensor, so go through tok(...).
             text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-            input_ids = tok(text, return_tensors="pt")["input_ids"]
+            input_ids = tok(text, return_tensors="pt")["input_ids"].to(DEVICE)
             out = model(input_ids=input_ids, use_cache=True)
 
             # store the KV cache, the most likely output token, and record the requests length

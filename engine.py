@@ -7,9 +7,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
+# device + dtype: GPU uses bf16 (the realistic memory-bound serving regime so
+# the throughput story holds); CPU falls back to fp32 for correctness work.
+# transformers 5.x wants `dtype=` (torch_dtype= is deprecated).
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
 # loads the tokenizer, the pretrained causal language model weights
 tok = AutoTokenizer.from_pretrained(MODEL)
-model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32)
+model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=DTYPE).to(DEVICE)
 
 # puts the model in inference mode
 model.eval()
@@ -21,7 +27,7 @@ def generate(prompt: str, max_new_tokens: int = 64):
     # transformers 5.x, not a bare tensor, so render to text then tokenize.
     msgs = [{"role": "user", "content": prompt}]
     text = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-    input_ids = tok(text, return_tensors="pt")["input_ids"]
+    input_ids = tok(text, return_tensors="pt")["input_ids"].to(DEVICE)
 
     t0 = time.perf_counter()
     ttft = None
@@ -94,8 +100,8 @@ def static_batch_generate(prompts: list[str], max_new_tokens: int = 64):
 
     # tokenize all the texts with padding=True (determined left padding)
     enc = tok(texts, return_tensors="pt", padding=True)
-    input_ids = enc["input_ids"] # these are the padded token ids
-    attention_mask = enc["attention_mask"] # matrix where 1 = real token and 0 is a padded token
+    input_ids = enc["input_ids"].to(DEVICE) # padded token ids, on device
+    attention_mask = enc["attention_mask"].to(DEVICE) # 1 = real token, 0 = pad
     B = input_ids.shape[0] # this is the batch size
 
     t0 = time.perf_counter()
@@ -140,7 +146,7 @@ def static_batch_generate(prompts: list[str], max_new_tokens: int = 64):
         
         # mask grows by one because it can now look at the new token at the end
         attention_mask = torch.cat(
-            [attention_mask, torch.ones((B, 1), dtype=attention_mask.dtype)],
+            [attention_mask, torch.ones((B, 1), dtype=attention_mask.dtype, device=attention_mask.device)],
             dim=1
         )
 
