@@ -66,6 +66,7 @@ def generate(prompt: str, max_new_tokens: int = 64):
     n = len(generated)
     return {
         "text": text,
+        "output_ids": generated,   # raw token ids, for the correctness gate
         "ttft_s": ttft,
         "total_s": dt,
         "out_tokens": n,
