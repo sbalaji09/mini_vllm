@@ -80,30 +80,26 @@ class ContinuousBatchingEngine:
 
         # loops through every request that was active before this step
         for r in self.running:
-            # only process not finished requests
-            if r.finished == False:
-                # run the model on the most recent token for this request
-                out = model(input_ids=r.last_token, past_key_values=r.past_key_values, use_cache=True)
-                
-                # takes the model's prediction for the next token and picks the highest-probability token
-                # then updates the output_ids and KV cache based on the new tokens
-                last_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                r.output_ids.append(last_token[0].item())
-                r.past_key_values = out.past_key_values
+            # run the model on the most recent token for this request
+            out = model(input_ids=r.last_token, past_key_values=r.past_key_values, use_cache=True)
+            
+            # takes the model's prediction for the next token and picks the highest-probability token
+            # then updates the output_ids and KV cache based on the new tokens
+            last_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            r.output_ids.append(last_token[0].item())
+            r.past_key_values = out.past_key_values
 
-                # saves the newly generated token and increments current sequence length
-                r.last_token = last_token
-                r.cur_len += 1
+            # saves the newly generated token and increments current sequence length
+            r.last_token = last_token
+            r.cur_len += 1
 
-                # checks whether the request should stop: hit eos or we have generated the maximum allowed number of tokens
-                if (r.last_token[0].item() == tok.eos_token_id) or (len(r.output_ids) >= r.max_new_tokens):
-                    # mark the request as finished and set the metric times
-                    r.finished = True
-                    r.t_done = time.perf_counter()
-                    self.completed.append(r)
-                # if the request is not done yet, keep it active
-                else:
-                    new_running.append(r)
+            # checks whether the request should stop: hit eos or we have generated the maximum allowed number of tokens
+            if (last_token[0].item() == tok.eos_token_id) or (len(r.output_ids) >= r.max_new_tokens):
+                # mark the request as finished and set the metric times
+                r.finished = True
+            # if the request is not done yet, keep it active
+            else:
+                new_running.append(r)
 
         # replace the old running list with only the requests that need more tokens
         self.running = new_running
