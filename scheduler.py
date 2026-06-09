@@ -102,6 +102,27 @@ class ContinuousBatchingEngine:
         # replace the old running list with only the requests that need more tokens
         self.running = new_running
     
+    def as_legacy_cache(self, past_key_values):
+        if hasattr(past_key_values, "to_legacy_cache"):
+            return past_key_values.to_legacy_cache()
+        return past_key_values
+    
+    def pad_one_cache(self, past_key_values, target_len: int):
+        padded = []
+        for key, value in past_key_values:
+            pad_len = target_len - key.shape[-2]
+
+            if pad_len > 0:
+                key_pad = key.new_zeros(*key.shape[:-2], pad_len, key.shape[-1])
+                value_pad = value.new_zeros(*value.shape[:-2], pad_len, value.shape[-1])
+
+                key = torch.cat([key_pad, key], dim=-2)
+                value = torch.cat([value_pad, value], dim=-2)
+            
+            padded.append((key, value))
+        
+        return tuple(padded)
+    
     def _decode_step_batched(self):
         if not self.running:
             return
