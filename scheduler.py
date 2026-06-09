@@ -112,7 +112,7 @@ class ContinuousBatchingEngine:
     def _retire(self):
         # empty list for requests that aren't done yet
         still_running = []
-        
+
         for r in self.running:
             # if the request is finished, then add it to the completed list and set its completed time
             if r.finished:
@@ -122,3 +122,18 @@ class ContinuousBatchingEngine:
             else:
                 still_running.append(r)
         self.running = still_running
+    
+    # defines one scheduler iteration
+    def step(self):
+        # moves new requests into running. does the prefill pass for newly admitted 
+        # requests and moves finished requets out of running
+        self._admit()
+        self._decode_step()
+        self._retire()
+
+    # defines the full scheduler loop
+    def run(self):
+        # runs one scheduler iteration: admit new work, decode running work, and retire finished work
+        while self.waiting or self.running:
+            self.step()
+        return self.completed
