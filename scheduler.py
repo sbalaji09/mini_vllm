@@ -162,31 +162,37 @@ class ContinuousBatchingEngine:
 
         return tuple(one)
     
+    # defines one batched decode step for all requests
     def _decode_step_batched(self):
         if not self.running:
             return
         
+        # stores the input ids in a local variable
         batch = self.running
         input_ids = torch.cat([r.last_token for r in batch], dim=0)
 
         batched_past_key_values, max_cache_len = self._batch_caches(batch)
 
+        # creates a batched attention mask with the shape [B, max_cache_len + 1]
         attention_mask = torch.zeros(
             (len(batch), max_cache_len + 1),
             dtype=torch.long,
             device=input_ids.device,
         )
 
+        # creates a tensor for the position ID of each request's new tokens
         position_ids = torch.empty(
             (len(batch), 1),
             dtype=torch.long,
             device=input_ids.device,
         )
 
+        # loops through each request: marks the real cached token and the new token as visible
         for i, r in enumerate(batch):
             attention_mask[i, max_cache_len - r.cur_len:] = 1
             position_ids[i, 0] = r.cur_len
         
+        # runs one model forward pass for the entire active batch
         out=model(
             input_ids=input_ids,
             past_key_values=batched_past_key_values,
@@ -195,9 +201,12 @@ class ContinuousBatchingEngine:
             use_cache=True,
         )
 
+        # gets the model's next-token prediction for each request
         next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
+        # loops through each request to scatter the batched outputs back into individual request state
         for i, r in enumerate(batch):
+            # adds the new generated token to the request and updates values accordingly
             token_id = next_tokens[i].item()
 
             r.output_ids.append(token_id)
