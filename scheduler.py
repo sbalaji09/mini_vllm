@@ -90,12 +90,12 @@ class ContinuousBatchingEngine:
                 r.finished = True
                 r.t_done = time.perf_counter()
                 self.completed.append(r)
-            
+                continue
+
             self._sync()
             _t = time.perf_counter()
             if self.cache is None:
                 self.cache = new_cache
-                self.running = [r]
             else:
                 L = self.cache.layers[0].keys.shape[-2]
                 p = new_cache.layers[0].keys.shape[-2]
@@ -146,40 +146,6 @@ class ContinuousBatchingEngine:
 
         return padded
 
-    # turns many per-request KV caches into one batched DynamicCache
-    def _batch_caches(self, requests):
-        max_len = max(r.cur_len for r in requests)
-
-        # pads each request based on the longest request
-        padded = [
-            self._pad_one_cache(r.past_key_values, max_len)
-            for r in requests
-        ]
-
-        # build a fresh DynamicCache: for each layer, stack all requests' key
-        # and value tensors along the batch dim and register them in order.
-        cache = DynamicCache()
-        for layer_idx in range(len(padded[0])):
-            keys = torch.cat([p[layer_idx][0] for p in padded], dim=0)
-            values = torch.cat([p[layer_idx][1] for p in padded], dim=0)
-            cache.update(keys, values, layer_idx)
-
-        return cache, max_len
-
-    # pulls one request's KV cache back out of the batched output cache,
-    # returning a fresh single-sequence DynamicCache (pad dropped via -keep_len:)
-    def _extract_one_cache(self, cache, batch_idx: int, keep_len: int):
-        one = DynamicCache()
-
-        # loops through every layer in the model output cache, slicing out this
-        # request's row and its real (un-padded) tail of length keep_len
-        for layer_idx, layer in enumerate(cache.layers):
-            key_i = layer.keys[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
-            value_i = layer.values[batch_idx:batch_idx + 1, :, -keep_len:, :].contiguous()
-            one.update(key_i, value_i, layer_idx)
-
-        return one
-    
     @torch.no_grad()
     def _decode_step(self):
         if not self.running:
@@ -247,70 +213,6 @@ class ContinuousBatchingEngine:
         self._sync()
         self.t_cache_mgmt += time.perf_counter() - _t
 
-    # defines one batched decode step for all requests
-    @torch.no_grad()
-    def _decode_step_batched(self):
-        if not self.running:
-            return
-        
-        # stores the input ids in a local variable
-        batch = self.running
-        input_ids = torch.cat([r.last_token for r in batch], dim=0)
-
-        # --- CACHE MGMT: build the batched (left-padded) cache + masks (timed) ---
-        self._sync(); _t = time.perf_counter()
-        # _batch_caches now returns a ready DynamicCache (5.x API)
-        past, max_cache_len = self._batch_caches(batch)
-
-        # creates a batched attention mask with the shape [B, max_cache_len + 1]
-        attention_mask = torch.zeros(
-            (len(batch), max_cache_len + 1),
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-
-        # creates a tensor for the position ID of each request's new tokens
-        position_ids = torch.empty(
-            (len(batch), 1),
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-
-        # loops through each request: marks the real cached token and the new token as visible
-        for i, r in enumerate(batch):
-            attention_mask[i, max_cache_len - r.cur_len:] = 1
-            position_ids[i, 0] = r.cur_len
-        self._sync(); self.t_cache_mgmt += time.perf_counter() - _t
-
-        # --- DECODE FORWARD: one model() pass for the whole active batch (timed) ---
-        self._sync(); _t = time.perf_counter()
-        out=model(
-            input_ids=input_ids,
-            past_key_values=past,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=True,
-        )
-        # gets the model's next-token prediction for each request
-        next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        self._sync(); self.t_decode_fwd += time.perf_counter() - _t
-
-        # --- CACHE MGMT: scatter outputs + extract each request's cache (timed) ---
-        self._sync(); _t = time.perf_counter()
-        # loops through each request to scatter the batched outputs back into individual request state
-        for i, r in enumerate(batch):
-            # adds the new generated token to the request and updates values accordingly
-            token_id = next_tokens[i].item()
-
-            r.output_ids.append(token_id)
-            r.last_token = next_tokens[i:i+1]
-            r.cur_len += 1
-            r.past_key_values = self._extract_one_cache(out.past_key_values, i, r.cur_len)
-
-            if token_id == tok.eos_token_id or len(r.output_ids) >= r.max_new_tokens:
-                r.finished = True
-        self._sync(); self.t_cache_mgmt += time.perf_counter() - _t
-
     @torch.no_grad()
     def _retire(self):
         if not self.running:
@@ -355,7 +257,7 @@ class ContinuousBatchingEngine:
         # moves new requests into running. does the prefill pass for newly admitted 
         # requests and moves finished requets out of running
         self._admit()
-        self._decode_step_batched()
+        self._decode_step()
         self._retire()
 
     # defines the full scheduler loop
