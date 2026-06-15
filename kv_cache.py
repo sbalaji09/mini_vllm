@@ -87,22 +87,17 @@ class PagedKVCache:
     def new_table(self) -> "BlockTable":
         return BlockTable(self.allocator)
 
-    # --- SCATTER: write ONE new token's K/V (all layers) into the blocks ---
+    # writes one new token's KV data into paged storage
     def scatter_token(self, table, k, v) -> bool:
-        # k, v: [n_layers, n_kv_heads, head_dim]  (the single new token, per layer)
-        # TODO (yours):
-        #   1. reserve the slot: if not table.append_token(): return False (no blocks)
-        #   2. p = table.length - 1                  # logical position just written
-        #      block_id, offset = table.physical(p)
-        #   3. for l in range(self.n_layers):
-        #          self.k_pool[l][block_id, :, offset, :] = k[l]
-        #          self.v_pool[l][block_id, :, offset, :] = v[l]
-        #   4. return True
+        # reserves space for one more token
         if not table.append_token():
             return False
         
+        # it finds the offset for where the token lives in physical storage
         p = table.length - 1
         block_id, offset = table.physical(p)
+
+        # for every layer, it then writes the token's key and value into the physical KV pools
         for l in range(self.n_layers):
             self.k_pool[l][block_id, :, offset, :] = k[l]
             self.v_pool[l][block_id, :, offset, :] = v[l]
