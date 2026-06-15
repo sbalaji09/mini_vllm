@@ -68,7 +68,7 @@ class PagedContinuousBatchingEngine:
             r.last_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             r.output_ids.append(r.last_token[0].item())
             r.t_first = time.perf_counter()
-            
+
             for pos in range(p):
                 k, v = self._token_kv(prompt_cache, 0, pos)
                 if not self.kv.scatter_token(r.table, k, v):
@@ -97,21 +97,52 @@ class PagedContinuousBatchingEngine:
         max_len = max(r.table.length for r in self.running)
         input_ids = torch.cat([r.last_token for r in self.running], dim=0)   # [R, 1]
 
-        # TODO (yours):
-        #   1. GATHER: k_layers, v_layers = self.kv.gather([r.table for r in self.running], max_len)
-        #   2. build past = DynamicCache(); for l: past.update(k_layers[l], v_layers[l], l)
-        #   3. mask/positions (SAME as Phase 1): attention_mask [R, max_len+1] with row i's
-        #      last (r.table.length + 1) cols = 1; position_ids [R,1] = r.table.length
-        #   4. out = model(input_ids, past_key_values=past, attention_mask=..., position_ids=..., use_cache=True)
-        #   5. next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        #   6. for i, r in enumerate(self.running):
-        #          k, v = self._token_kv(out.past_key_values, i, max_len)   # the appended token
-        #          self.kv.scatter_token(r.table, k, v)
-        #          tid = next_tokens[i].item(); r.output_ids.append(tid)
-        #          r.last_token = next_tokens[i:i+1]
-        #          if tid == tok.eos_token_id or len(r.output_ids) >= r.max_new_tokens:
-        #              r.finished = True
-        raise NotImplementedError
+        k_layers, v_layers = self.kv.gather([r.table for r in self.running], max_len)
+        past = DynamicCache()
+        for l in range(max_len):
+            past.update(k_layers[l], v_layers[l], l)
+
+        attention_mask = torch.zeros(
+            R,
+            max_len + 1,
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+
+        position_ids = torch.empty(
+            R,
+            1,
+            dtype=torch.long,
+            device=input_ids.device
+        )
+
+        for i, r in enumerate(self.running):
+            attention_mask[i, -(r.table.length + 1):] = 1
+            position_ids[i, 0] = r.table.length
+        
+        out = model(
+            input_ids=input_ids,
+            past_key_values=past,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+
+        next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+        ids = next_tokens.squeeze(1).tolist()
+        eos = (next_tokens.squeeze(1) == tok.eos_token_id).tolist()
+
+        for i, r in enumerate(self.running):
+            k, v = self._token_kv(out.past_key_values, i, max_len)
+            self.kv.scatter_token(r.table, k, v)
+
+            tid = ids[i]
+            r.output_ids.append(tid)
+            r.last_token = next_tokens[i:i + 1]
+
+            if eos[i] or len(r.output_ids) >= r.max_new_tokens:
+                r.finished = True
 
     @torch.no_grad()
     def _retire(self):
