@@ -2,6 +2,8 @@
 paged KV cache, LEVEL A (allocator + accounting).
 """
 
+import torch
+
 BLOCK_SIZE = 16   # tokens per block
 
 # fixed pool of physical blocks and a free list
@@ -66,6 +68,112 @@ class BlockTable:
         self.block_ids = []
         self.length = 0
 
+# physical KV storage as fixed blocks
+class PagedKVCache:
+    def __init__(self, num_blocks, n_layers, n_kv_heads, head_dim,
+                 dtype=torch.float32, device="cpu"):
+        self.allocator = BlockAllocator(num_blocks)
+        self.n_layers = n_layers
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        # per-layer physical pools: [num_blocks, n_kv_heads, BLOCK_SIZE, head_dim]
+        self.k_pool = [torch.zeros(num_blocks, n_kv_heads, BLOCK_SIZE, head_dim,
+                                   dtype=dtype, device=device)
+                       for _ in range(n_layers)]
+        self.v_pool = [torch.zeros(num_blocks, n_kv_heads, BLOCK_SIZE, head_dim,
+                                   dtype=dtype, device=device)
+                       for _ in range(n_layers)]
+
+    def new_table(self) -> "BlockTable":
+        return BlockTable(self.allocator)
+
+    # --- SCATTER: write ONE new token's K/V (all layers) into the blocks ---
+    def scatter_token(self, table, k, v) -> bool:
+        # k, v: [n_layers, n_kv_heads, head_dim]  (the single new token, per layer)
+        # TODO (yours):
+        #   1. reserve the slot: if not table.append_token(): return False (no blocks)
+        #   2. p = table.length - 1                  # logical position just written
+        #      block_id, offset = table.physical(p)
+        #   3. for l in range(self.n_layers):
+        #          self.k_pool[l][block_id, :, offset, :] = k[l]
+        #          self.v_pool[l][block_id, :, offset, :] = v[l]
+        #   4. return True
+        if not table.append_token():
+            return False
+        
+        p = table.length - 1
+        block_id, offset = table.physical(p)
+        for l in range(self.n_layers):
+            self.k_pool[l][block_id, :, offset, :] = k[l]
+            self.v_pool[l][block_id, :, offset, :] = v[l]
+        return True
+
+    # --- GATHER: rebuild left-padded contiguous K/V for the forward (the SLOW part) ---
+    def gather(self, tables, max_len):
+        # Returns (k_layers, v_layers): two lists of length n_layers, each a tensor
+        # [R, n_kv_heads, max_len, head_dim], left-padded per sequence so every
+        # sequence's real tokens align at the RIGHT (identical layout to Phase 1).
+        # TODO (yours): for each layer l, start from a zeros [R, H, max_len, D]; then
+        #   for row s, table in enumerate(tables):
+        #     ids = table.block_ids
+        #     blk = self.k_pool[l][ids]                 # [n_blk, H, BLOCK, D]
+        #     seq = blk.permute(1, 0, 2, 3).reshape(self.n_kv_heads, -1, self.head_dim)
+        #     seq = seq[:, :table.length, :]            # drop last-block slack -> [H, len, D]
+        #     out_k[s, :, max_len - table.length:, :] = seq   # LEFT-pad: align right
+        #   (do the same for V from self.v_pool). return (k_layers, v_layers).
+        R = len(tables)
+        k_layers = []
+        v_layers = []
+
+        for l in range(self.n_layers):
+            out_k = torch.zeros(
+                R,
+                self.n_kv_heads,
+                max_len,
+                self.head_dim,
+                dtype=self.k_pool[l].dtype,
+                device=self.k_pool[l].device
+            )
+            out_v = torch.zeros(
+                R,
+                self.n_kv_heads,
+                max_len,
+                self.head_dim,
+                dtype=self.v_pool[l].dtype,
+                device=self.v_pool[l].device,
+            )
+
+            for s, table in enumerate(tables):
+                ids = table.block_ids
+                if table.length == 0:
+                    continue
+
+                k_blocks = self.k_pool[l][ids]
+                v_blocks = self.v_pool[l][ids]
+
+                k_seq = k_blocks.permute(1, 0, 2, 3).reshape(
+                    self.n_kv_heads,
+                    -1,
+                    self.head_dim
+                )
+                v_seq = v_blocks.permute(1, 0, 2, 3).reshape(
+                    self.n_kv_heads,
+                    -1,
+                    self.head_dim,
+                )
+
+                k_seq = k_seq[:, :table.length, :]
+                v_seq = v_seq[:, :table.length, :]
+
+                start = max_len - table.length
+                out_k[s, :, start:, :] = k_seq
+                out_v[s, :, start:, :] = v_seq
+
+            k_layers.append(out_k)
+            v_layers.append(out_v)
+    
+        return k_layers, v_layers
+
 
 if __name__ == "__main__":
     # --- A1 unit test (glue): exercises your allocator + block table ---
@@ -102,3 +210,29 @@ if __name__ == "__main__":
     assert seq.length == 0 and seq.block_ids == []
 
     print("A1 OK — allocator, block table, mapping, and free-pool all correct.")
+
+    # --- B1 round-trip test (glue): scatter known K/V, gather, assert equal ---
+    torch.manual_seed(0)
+    NL, H, D = 2, 2, 4
+    pool = PagedKVCache(num_blocks=8, n_layers=NL, n_kv_heads=H, head_dim=D)
+    lengths = [20, 5]                       # mixed lengths -> exercises left-pad
+    ptables = [pool.new_table() for _ in lengths]
+    truth = []                             # truth[s] = list of (k, v) per token, each [NL, H, D]
+    for s, Ln in enumerate(lengths):
+        toks = []
+        for _ in range(Ln):
+            k = torch.randn(NL, H, D)
+            v = torch.randn(NL, H, D)
+            assert pool.scatter_token(ptables[s], k, v) is True
+            toks.append((k, v))
+        truth.append(toks)
+
+    max_len = max(lengths)
+    k_layers, v_layers = pool.gather(ptables, max_len)
+    for s, Ln in enumerate(lengths):
+        for l in range(NL):
+            for t in range(Ln):
+                col = max_len - Ln + t       # left-padded position of token t
+                assert torch.allclose(k_layers[l][s, :, col, :], truth[s][t][0][l])
+                assert torch.allclose(v_layers[l][s, :, col, :], truth[s][t][1][l])
+    print("B1 OK — scatter + gather round-trip correct (incl. left-pad alignment).")
