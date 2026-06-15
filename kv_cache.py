@@ -103,24 +103,15 @@ class PagedKVCache:
             self.v_pool[l][block_id, :, offset, :] = v[l]
         return True
 
-    # --- GATHER: rebuild left-padded contiguous K/V for the forward (the SLOW part) ---
+    # rebuilds contiguous left-padded KV tensors from paged storage
     def gather(self, tables, max_len):
-        # Returns (k_layers, v_layers): two lists of length n_layers, each a tensor
-        # [R, n_kv_heads, max_len, head_dim], left-padded per sequence so every
-        # sequence's real tokens align at the RIGHT (identical layout to Phase 1).
-        # TODO (yours): for each layer l, start from a zeros [R, H, max_len, D]; then
-        #   for row s, table in enumerate(tables):
-        #     ids = table.block_ids
-        #     blk = self.k_pool[l][ids]                 # [n_blk, H, BLOCK, D]
-        #     seq = blk.permute(1, 0, 2, 3).reshape(self.n_kv_heads, -1, self.head_dim)
-        #     seq = seq[:, :table.length, :]            # drop last-block slack -> [H, len, D]
-        #     out_k[s, :, max_len - table.length:, :] = seq   # LEFT-pad: align right
-        #   (do the same for V from self.v_pool). return (k_layers, v_layers).
         R = len(tables)
         k_layers = []
         v_layers = []
 
+        # for each layer, it creates output tensors shaped: [R, n_kv_heads, max_len, head_dim]
         for l in range(self.n_layers):
+            # creates the tensors with all zeros of the shape given
             out_k = torch.zeros(
                 R,
                 self.n_kv_heads,
@@ -138,14 +129,17 @@ class PagedKVCache:
                 device=self.v_pool[l].device,
             )
 
+            # enumerate through all the tables and s being the sequence
             for s, table in enumerate(tables):
                 ids = table.block_ids
                 if table.length == 0:
                     continue
-
+                
+                # fetches the physical blocks using the sequence's block_ids
                 k_blocks = self.k_pool[l][ids]
                 v_blocks = self.v_pool[l][ids]
 
+                # reshapes the blocks into a normal sequence layout
                 k_seq = k_blocks.permute(1, 0, 2, 3).reshape(
                     self.n_kv_heads,
                     -1,
@@ -157,9 +151,12 @@ class PagedKVCache:
                     self.head_dim,
                 )
 
+                # this trims away unused slack from the final block
                 k_seq = k_seq[:, :table.length, :]
                 v_seq = v_seq[:, :table.length, :]
-
+                
+                # this writes the real tokens into the right side of the output tensor
+                # creates left padding for shorter sequences so all sequences align at their most recent token
                 start = max_len - table.length
                 out_k[s, :, start:, :] = k_seq
                 out_v[s, :, start:, :] = v_seq
