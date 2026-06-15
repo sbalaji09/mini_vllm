@@ -57,6 +57,7 @@ class PagedContinuousBatchingEngine:
     @torch.no_grad()
     def _admit(self):
         while len(self.running) < self.max_batch_size and self.waiting:
+            # take the oldest waiting request and formats the prompt into Qwen's chat format
             r = self.waiting.pop(0)
             text = tok.apply_chat_template([{"role": "user", "content": r.prompt}],
                                            add_generation_prompt=True, tokenize=False)
@@ -64,11 +65,16 @@ class PagedContinuousBatchingEngine:
             out = model(input_ids=input_ids, use_cache=True)
             prompt_cache = out.past_key_values          # [1, H, p, D] per layer
             p = input_ids.shape[-1]
+
+            # creates a page table for this request inside the paged KV store
             r.table = self.kv.new_table()
+
+            # picks the first generatd token and stores it in the request output
             r.last_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             r.output_ids.append(r.last_token[0].item())
             r.t_first = time.perf_counter()
 
+            # loops through every prompt token position and writes that tokens K/V into paged storage if there is a physical block available
             for pos in range(p):
                 k, v = self._token_kv(prompt_cache, 0, pos)
                 if not self.kv.scatter_token(r.table, k, v):
@@ -77,17 +83,18 @@ class PagedContinuousBatchingEngine:
                     self.completed.append(r)
                     break
             
+            # skips normal admission if the request already failed or completed
             if r.finished:
                 continue
-
+            
+            # if the first generated token is EOS, then complete the request
+            # otherwise, puts the request into the active running set
             if r.last_token[0].item() == tok.eos_token_id:
                 r.finished = True
                 r.t_done = time.perf_counter()
                 self.completed.append(r)
             else:
                 self.running.append(r)
-                
-            raise NotImplementedError
 
     @torch.no_grad()
     def _decode_step(self):
@@ -97,11 +104,15 @@ class PagedContinuousBatchingEngine:
         max_len = max(r.table.length for r in self.running)
         input_ids = torch.cat([r.last_token for r in self.running], dim=0)   # [R, 1]
 
+        # rebuilds contiguous left-padded KV tensors from paged storage
         k_layers, v_layers = self.kv.gather([r.table for r in self.running], max_len)
-        past = DynamicCache()
-        for l in range(max_len):
+        past = DynamicCache() # creates HuggingFace cache object to pass into the model
+        
+        # loads each layer's gathered K/V tensors into the cache
+        for l in range(self.n_layers):
             past.update(k_layers[l], v_layers[l], l)
 
+        # creates a mask for cached tokens with the new input token accounted for
         attention_mask = torch.zeros(
             R,
             max_len + 1,
