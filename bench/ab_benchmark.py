@@ -128,6 +128,25 @@ def bench_chunked_static(prompts, B, cap):
     return summarize("chunked_static", ttfts, lats, total, wall, _peak_mem())
 
 
+def bench_paged(prompts, B, cap, num_blocks=512):
+    # Phase 2 Level B: same continuous-batching schedule, but K/V in the paged
+    # store with a per-step gather. EXPECTED to be slower than `continuous` --
+    # the gather is a full re-copy every step that a CUDA kernel would remove.
+    # This measures that per-op cost; it is the honest caveat, quantified.
+    from paged_engine import PagedContinuousBatchingEngine
+    _reset_mem()
+    eng = PagedContinuousBatchingEngine(max_batch_size=B, num_blocks=num_blocks)
+    t0 = time.perf_counter()
+    for p in prompts:
+        eng.submit(p, max_new_tokens=cap)
+    completed = eng.run()
+    wall = time.perf_counter() - t0
+    ttfts = [r.t_first - r.t_arrival for r in completed]
+    lats = [r.t_done - r.t_arrival for r in completed]
+    total = sum(len(r.output_ids) for r in completed)
+    return summarize("paged (L-B)", ttfts, lats, total, wall, _peak_mem())
+
+
 def print_row(s):
     print(f"{s['system']:>16} | reqs {s['requests']:>3} | "
           f"wall {s['wall_clock_s']:>7}s | tok/s {str(s['throughput_tok_s']):>7} | "
@@ -151,22 +170,28 @@ def print_breakdown(s):
 
 if __name__ == "__main__":
     N = 8        # bump to 100+ on GPU for stable P99
-    B = 4        # capacity (max concurrent sequences) -- SAME for both systems
-    CAP = 64     # max_new_tokens cap; real length variance comes from early EOS
+    B = 4        # capacity (max concurrent sequences) -- SAME for all systems
+    CAP = 32     # max_new_tokens cap; real length variance comes from early EOS
+    NUM_BLOCKS = 128   # paged budget for this small CPU run (bump on GPU)
 
     prompts = [WORKLOAD[i % len(WORKLOAD)] for i in range(N)]
 
     stat = bench_chunked_static(prompts, B, CAP)
     cont = bench_continuous(prompts, B, CAP)
+    paged = bench_paged(prompts, B, CAP, num_blocks=NUM_BLOCKS)
 
     print(f"\nworkload={N} reqs, capacity B={B}, max_new_tokens={CAP}\n")
     print_row(stat)
     print_row(cont)
+    print_row(paged)
     print_breakdown(cont)
 
     if cont["throughput_tok_s"] and stat["throughput_tok_s"]:
-        x = cont["throughput_tok_s"] / stat["throughput_tok_s"]
-        print(f"\ncontinuous / static throughput = {x:.2f}x")
+        print(f"\ncontinuous / static throughput = "
+              f"{cont['throughput_tok_s'] / stat['throughput_tok_s']:.2f}x")
+    if cont["throughput_tok_s"] and paged["throughput_tok_s"]:
+        print(f"paged per-op cost: continuous / paged = "
+              f"{cont['throughput_tok_s'] / paged['throughput_tok_s']:.2f}x slower "
+              f"(the gather; a CUDA kernel would remove it)")
     if not torch.cuda.is_available():
-        print("\n[CPU run = harness validation only. Continuous may tie/lose here; "
-              "the win is a memory-bound GPU effect. Run on the L4 for the headline.]")
+        print("\n[CPU run = harness validation only. Run on the L4 for the real numbers.]")

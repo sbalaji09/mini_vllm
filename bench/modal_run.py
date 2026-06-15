@@ -57,17 +57,23 @@ def run_bench(n: int, b: int, cap: int):
 
     stat = ab.bench_chunked_static(prompts, b, cap)
     cont = ab.bench_continuous(prompts, b, cap)
+    paged = ab.bench_paged(prompts, b, cap, num_blocks=max(512, b * 16))
 
     print(f"\nworkload={n} reqs, capacity B={b}, max_new_tokens={cap}\n")
     ab.print_row(stat)
     ab.print_row(cont)
+    ab.print_row(paged)
     ab.print_breakdown(cont)
     if cont["throughput_tok_s"] and stat["throughput_tok_s"]:
-        ratio = cont["throughput_tok_s"] / stat["throughput_tok_s"]
-        print(f"\ncontinuous / static throughput = {ratio:.2f}x")
+        print(f"\ncontinuous / static throughput = "
+              f"{cont['throughput_tok_s'] / stat['throughput_tok_s']:.2f}x")
+    if cont["throughput_tok_s"] and paged["throughput_tok_s"]:
+        print(f"paged per-op cost: continuous / paged = "
+              f"{cont['throughput_tok_s'] / paged['throughput_tok_s']:.2f}x slower "
+              f"(the per-step gather; a CUDA kernel would remove it)")
 
     hf_cache.commit()   # persist the downloaded weights for next run
-    return {"static": stat, "continuous": cont}
+    return {"static": stat, "continuous": cont, "paged": paged}
 
 
 @app.local_entrypoint()
