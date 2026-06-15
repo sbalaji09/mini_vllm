@@ -120,6 +120,7 @@ class PagedContinuousBatchingEngine:
             device=input_ids.device,
         )
 
+        # creates [R, 1] position IDs for the new token
         position_ids = torch.empty(
             R,
             1,
@@ -127,10 +128,12 @@ class PagedContinuousBatchingEngine:
             device=input_ids.device
         )
 
+        # numerates through all the running tokens and marks the real cached tokens and the current input token as visible
         for i, r in enumerate(self.running):
             attention_mask[i, -(r.table.length + 1):] = 1
             position_ids[i, 0] = r.table.length
         
+        # runs one batched decode forward pass
         out = model(
             input_ids=input_ids,
             past_key_values=past,
@@ -139,19 +142,24 @@ class PagedContinuousBatchingEngine:
             use_cache=True,
         )
 
+        # next token for each request
         next_tokens = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
+        # copies generated token IDs and EOS flags to Python lists
         ids = next_tokens.squeeze(1).tolist()
         eos = (next_tokens.squeeze(1) == tok.eos_token_id).tolist()
 
         for i, r in enumerate(self.running):
+            # extracts the newly appended token's K/V and writes it into the paged storage
             k, v = self._token_kv(out.past_key_values, i, max_len)
             self.kv.scatter_token(r.table, k, v)
 
+            # stores the generated token and prepares it as next step's input
             tid = ids[i]
             r.output_ids.append(tid)
             r.last_token = next_tokens[i:i + 1]
 
+            # marks the request finished if it hit EOS or token limit
             if eos[i] or len(r.output_ids) >= r.max_new_tokens:
                 r.finished = True
 
