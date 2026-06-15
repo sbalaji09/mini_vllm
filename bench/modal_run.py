@@ -27,6 +27,8 @@ image = (
     .pip_install("torch", "transformers==5.10.2")
     .add_local_file("engine.py", "/root/engine.py")
     .add_local_file("scheduler.py", "/root/scheduler.py")
+    .add_local_file("kv_cache.py", "/root/kv_cache.py")
+    .add_local_file("paged_engine.py", "/root/paged_engine.py")
     .add_local_dir("bench", "/root/bench")
 )
 
