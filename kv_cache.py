@@ -31,44 +31,40 @@ class BlockAllocator:
         for id in block_ids:
             self.free_list.append(id)
 
-
+# represents an ordered list of physical block ids where it maps a sequence's logical to physical map
 class BlockTable:
-    """One sequence's logical->physical map: an ordered list of physical block
-    ids. Mirrors an OS page table for a single address space."""
-
+    # creates the allocator, block_ids, and length variables
     def __init__(self, allocator: BlockAllocator):
         self.allocator = allocator
-        self.block_ids = []     # physical blocks owned, in logical order
-        self.length = 0         # tokens currently stored in this sequence
+        self.block_ids = []
+        self.length = 0 
 
+    # account for one new token landing at the end by allocating a new spot if necessary
     def append_token(self) -> bool:
-        # TODO (yours): account for ONE new token landing at logical position
-        #   self.length.
-        #   - A new physical block is needed exactly when the current length sits
-        #     on a block boundary: self.length % BLOCK_SIZE == 0. (This also
-        #     covers the very first token, length == 0 -> allocate block #1.)
-        #     When needed: block = self.allocator.allocate(); append to block_ids.
-        #     If allocation fails (pool empty), return False WITHOUT incrementing.
-        #   - Otherwise the token fits in the current last block.
-        #   - increment self.length, return True.
-        raise NotImplementedError
+        if self.length % BLOCK_SIZE == 0:
+            block = self.allocator.allocate()
+            if block == None:
+                return False
+            self.block_ids.append(block)
+        
+        self.length += 1
+        return True
 
+    # translates a logical token position to its physical storage in the cache
     def physical(self, logical_pos: int):
-        # TODO (yours): translate a logical token position to physical storage:
-        #   block_id = self.block_ids[logical_pos // BLOCK_SIZE]
-        #   offset   = logical_pos % BLOCK_SIZE
-        #   return (block_id, offset)
-        raise NotImplementedError
+        block_id = self.block_ids[logical_pos // BLOCK_SIZE]
+        offset = logical_pos % BLOCK_SIZE
+        return (block_id, offset)
 
+    # returns the capacity reserved for this sequence
     def reserved_tokens(self) -> int:
-        # capacity reserved for this sequence, including last-block slack.
-        # (used vs reserved is the fragmentation measurement later.)
         return len(self.block_ids) * BLOCK_SIZE
 
+    # frees all the block_ids in the BlockTable and resets the length and block_ids list
     def free_all(self):
-        # TODO (yours): return ALL of this sequence's blocks to the allocator and
-        #   reset block_ids / length (called on retire).
-        raise NotImplementedError
+        self.allocator.free(self.block_ids)
+        self.block_ids = []
+        self.length = 0
 
 
 if __name__ == "__main__":
