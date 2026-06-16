@@ -51,54 +51,59 @@ def test_softmax():
     print(f"K0 OK — Triton softmax matches torch (max abs err {max_err:.2e}).")
 
 
-# ---------------- K1: contiguous flash-decode attention ----------------
-# One query token attends over a sequence's CONTIGUOUS K/V [seq_len, head_dim],
-# single sequence + single head. The online softmax streams the keys in blocks of
-# BLOCK_N so we never materialize the full [seq_len] score row. grid = (1,).
-
+# this defines the low-level GPU kernel where one query token attends over a sequence's contiguous K/V, single sequence, and single head
 @triton.jit
 def flash_decode_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
                         seq_len, scale,
-                        stride_kn, stride_kd,      # K: [seq_len, head_dim] strides
-                        stride_vn, stride_vd,      # V: [seq_len, head_dim] strides
+                        stride_kn, stride_kd,      # memory strides for indexing K
+                        stride_vn, stride_vd,      # memory strides for indexing V
                         BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, HEAD_DIM: tl.constexpr):
+    
+    # creates head dimension offsets and masks out specific lanes
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < HEAD_DIM
     q = tl.load(q_ptr + offs_d, mask=mask_d, other=0.0)     # [BLOCK_D]
 
     # running online-softmax state
-    m = -float("inf")                                       # running max (scalar)
-    l = 0.0                                                 # running sum (scalar)
+    m = -float("inf")                                       # running max
+    l = 0.0                                                 # running sum
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)             # running weighted V
 
+    # iterate through K/V in blocks instead of loading the whole sequence at once
     for start in range(0, seq_len, BLOCK_N):
+        # creates token offsets for this block and masks out positions past the sequence end
         offs_n = start + tl.arange(0, BLOCK_N)
         mask_n = offs_n < seq_len
-        # load this key/value block: [BLOCK_N, BLOCK_D]
+
+        # load a block of keys and values
         k = tl.load(k_ptr + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
                     mask=mask_n[:, None] & mask_d[None, :], other=0.0)
         v = tl.load(v_ptr + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
                     mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
+        # computes dot-product attention scores for this specific block
         scores = tl.sum(k*q[None, :], axis=1) * scale
         scores = tl.where(mask_n, scores, -float("inf"))
 
+        # updates running max across all tokens seen so far
         m_new = tl.maximum(m, tl.max(scores, axis=0))
 
+        # computes this block's exponentials and the correction factor for previous accumulated values
         p = tl.exp(scores-m_new)
         corr = tl.exp(m - m_new)
 
+        # updates the softmax denominator and the weighted value sum
         l = l * corr + tl.sum(p, axis=0)
         acc = acc * corr + tl.sum(p[:, None] * v, axis=0)
 
-        m = m_new
+        # stores the new running max for the next block
+        m = m_new   
 
     o = acc / l
     tl.store(o_ptr + offs_d, o, mask=mask_d)
 
-
+# python wrapper for flash_decode_kernel
 def flash_decode(q, k, v, scale):
-    # q: [head_dim] ; k, v: [seq_len, head_dim]  (all contiguous, fp32)
     seq_len, head_dim = k.shape
     o = torch.empty(head_dim, device=q.device, dtype=torch.float32)
     BLOCK_D = triton.next_power_of_2(head_dim)
