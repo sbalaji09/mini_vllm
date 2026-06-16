@@ -18,15 +18,11 @@ def softmax_kernel(x_ptr, out_ptr, n_cols, row_stride, BLOCK: tl.constexpr):
     row_start = x_ptr + row * row_stride
     out_start = out_ptr + row * row_stride
 
-    # TODO (yours): type these understanding each line — they ARE the softmax,
-    # and steps 1/2 are exactly what K1's online version generalizes.
-    #   1. x = tl.load(row_start + cols, mask=mask, other=float("-inf"))
-    #        (masked-out lanes load -inf so they never win the max or add to the sum)
-    #   2. x = x - tl.max(x, axis=0)            # numerical stability
-    #      e = tl.exp(x)
-    #      y = e / tl.sum(e, axis=0)
-    #   3. tl.store(out_start + cols, y, mask=mask)
-    # (no `raise`/Python exceptions inside @triton.jit — it compiles to GPU code.)
+    x = tl.load(row_start + cols, mask=mask, other=float("-inf"))
+    x = x - tl.max(x, axis=0)
+    e = tl.exp(x)
+    y = e / tl.sum(e, axis=0)
+    tl.store(out_start + cols, y, mask=mask)
 
 
 def triton_softmax(x: torch.Tensor) -> torch.Tensor:
