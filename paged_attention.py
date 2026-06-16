@@ -221,11 +221,7 @@ def test_paged_decode():
     assert torch.allclose(got, ref, atol=1e-3), f"mismatch, max abs err {err}"
     print(f"K2 OK — paged-decode attention matches torch over shuffled blocks (max abs err {err:.2e}).")
 
-
-# ---------------- K3: BATCHED + GQA paged decode ----------------
-# grid = (R sequences, n_q_heads). One program per (sequence, query head).
-# Same paged read + online softmax as K2; only the indexing generalizes.
-
+# defines a batched paged-attention decode kernel
 @triton.jit
 def paged_decode_batched_kernel(q_ptr, k_pool_ptr, v_pool_ptr, o_ptr, bt_ptr, seqlen_ptr,
                                 scale, group,
@@ -240,22 +236,19 @@ def paged_decode_batched_kernel(q_ptr, k_pool_ptr, v_pool_ptr, o_ptr, bt_ptr, se
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < HEAD_DIM
 
-    # TODO (yours) — the batched/GQA indexing (everything else below is K2 verbatim):
-    #   kv_head = pid_h // group                                  # GQA: many q-heads -> one kv-head
-    #   q = tl.load(q_ptr + pid_r*stride_qr + pid_h*stride_qh + offs_d*stride_qd,
-    #               mask=mask_d, other=0.0)
-    #   seq_len = tl.load(seqlen_ptr + pid_r)                     # this sequence's length (scalar)
-    #   bt_row  = bt_ptr + pid_r * stride_btr                     # this sequence's block-table row
+    # maps the query head to its shared KV head
     kv_head = pid_h // group
     q = tl.load(q_ptr + pid_r*stride_qr + pid_h*stride_qh + offs_d*stride_qd,
-                mask=mask_d, other=0.0)
-    seq_len = tl.load(seqlen_ptr + pid_r)
-    bt_row = bt_ptr + pid_r * stride_btr
+                mask=mask_d, other=0.0) # loads the query vector
+    seq_len = tl.load(seqlen_ptr + pid_r) # loads the sequence's length
+    bt_row = bt_ptr + pid_r * stride_btr # gets the start of this sequence's block-table row
 
+    # init softmax state
     m = -float("inf")
     l = 0.0
     acc = tl.zeros([BLOCK_D], dtype=tl.float32)
 
+    # loops through each logical block of this sequence
     n_blocks = tl.cdiv(seq_len, BLOCK_SIZE)
     for j in range(0, n_blocks):
         phys = tl.load(bt_row + j)
@@ -263,13 +256,17 @@ def paged_decode_batched_kernel(q_ptr, k_pool_ptr, v_pool_ptr, o_ptr, bt_ptr, se
         tok = j * BLOCK_SIZE + offs_t
         mask_t = tok < seq_len
 
+        # computes the base pointer for this physical block and KV head in the K pool + loads the key block
         base_k = k_pool_ptr + phys * stride_blk + kv_head * stride_h
         k = tl.load(base_k + offs_t[:, None] * stride_t + offs_d[None, :] * stride_d,
                     mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+        
+        # same, but for the V pool
         base_v = v_pool_ptr + phys * stride_blk + kv_head * stride_h
         v = tl.load(base_v + offs_t[:, None] * stride_t + offs_d[None, :] * stride_d,
                     mask=mask_t[:, None] & mask_d[None, :], other=0.0)
 
+        # computes attention scores for this query against the current key block
         scores = tl.sum(k * q[None, :], axis=1) * scale
         scores = tl.where(mask_t, scores, -float("inf"))
         m_new = tl.maximum(m, tl.max(scores, axis=0))
@@ -280,11 +277,11 @@ def paged_decode_batched_kernel(q_ptr, k_pool_ptr, v_pool_ptr, o_ptr, bt_ptr, se
         m = m_new
 
     o = acc / l
-    # TODO (yours): store O at (pid_r, pid_h):
-    #   tl.store(o_ptr + pid_r*stride_or + pid_h*stride_oh + offs_d*stride_od, o, mask=mask_d)
+    
+    # normalizes the accumulated value sum to produce the final attention output
     tl.store(o_ptr + pid_r*stride_or + pid_h*stride_oh + offs_d*stride_od, o, mask=mask_d)
 
-
+# Python wrapper for this custom kernel
 def paged_decode_batched(q, k_pool, v_pool, block_tables, seq_lens, n_kv_heads, scale):
     R, n_q_heads, head_dim = q.shape
     group = n_q_heads // n_kv_heads
