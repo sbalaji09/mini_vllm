@@ -124,12 +124,16 @@ def test_decode_step():
     prompt_cache = out.past_key_values
     first = out.logits[:, -1, :].argmax(-1, keepdim=True)     # [1,1]
 
-    # reference: the model's own next-step logits (SDPA over the contiguous cache)
+    # Scatter the prompt into our pool FIRST: model(..., past_key_values=prompt_cache)
+    # below MUTATES prompt_cache in place (appends `first`), so reading it after that
+    # would double-scatter the first token. Order matters.
+    kv = _new_pool()
+    table = scatter_prompt(kv, prompt_cache)                  # P prompt tokens
+
+    # reference: the model's own next-step logits (this appends `first` to prompt_cache)
     ref = model(input_ids=first, past_key_values=prompt_cache, use_cache=True).logits[:, -1, :]
 
-    # ours: scatter prompt into the pool, extend the table by the new token, run our forward
-    kv = _new_pool()
-    table = scatter_prompt(kv, prompt_cache)
+    # ours: extend the table by the new token, run our custom forward
     table.append_token()                                     # reserve the first-token slot
     got = decode_logits(kv, first, [table])                  # [1, vocab]
 
