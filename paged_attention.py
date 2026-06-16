@@ -130,6 +130,97 @@ def test_flash_decode():
     assert torch.allclose(got, ref, atol=1e-3), f"mismatch, max abs err {err}"
     print(f"K1 OK — flash-decode attention matches torch (max abs err {err:.2e}).")
 
+# same softmax as flash_decode_kernel but the K/V per token are directly read out of the paged pool via a block table
+@triton.jit
+def paged_decode_kernel(q_ptr, k_pool_ptr, v_pool_ptr, o_ptr, bt_ptr,
+                        seq_len, scale, kv_head,
+                        stride_blk, stride_h, stride_t, stride_d,   # pool strides
+                        BLOCK_SIZE: tl.constexpr, BLOCK_D: tl.constexpr, HEAD_DIM: tl.constexpr):
+    # creates the offsets and the masks
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < HEAD_DIM
+
+    # loads the query vector
+    q = tl.load(q_ptr + offs_d, mask=mask_d, other=0.0)
+
+    # initializes online softmax state: running max, running denominator, and weighted value accumulator
+    m = -float("inf")
+    l = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    # computes how many logical blocks the sequence spans and loops through them
+    n_blocks = tl.cdiv(seq_len, BLOCK_SIZE)
+    for j in range(0, n_blocks):
+        phys = tl.load(bt_ptr + j)                 # physical block id for logical block j
+        offs_t = tl.arange(0, BLOCK_SIZE)
+        tok = j * BLOCK_SIZE + offs_t              # global token indices in this block
+        mask_t = tok < seq_len
+
+        # computes the base pointer for this physical block and KV head in the key pool
+        base_k = k_pool_ptr + phys * stride_blk + kv_head * stride_h
+        # loads a tile of keys from paged storage
+        k = tl.load(base_k + offs_t[:, None] * stride_t + offs_d[None, :] * stride_d,
+                    mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+        
+        # same computation but in the value pool
+        base_v = v_pool_ptr + phys * stride_blk + kv_head * stride_h
+        v = tl.load(base_v + offs_t[:, None] * stride_t + offs_d[None, :] * stride_d,
+                    mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+        
+        # online softmax same as earlier
+        scores = tl.sum(k * q[None, :], axis=1) * scale
+        scores = tl.where(mask_t, scores, -float("inf"))
+        m_new = tl.maximum(m, tl.max(scores, axis=0))
+        p = tl.exp(scores - m_new)
+        corr = tl.exp(m - m_new)
+        l = l * corr + tl.sum(p, axis=0)
+        acc = acc * corr + tl.sum(p[:, None] * v, axis=0)
+        m = m_new
+
+    o = acc / l
+    tl.store(o_ptr + offs_d, o, mask=mask_d)
+
+# Python wrapper around the Triton paged decode kernel
+def paged_decode(q, k_pool, v_pool, block_table, seq_len, kv_head, scale):
+    head_dim = q.shape[0]
+    BLK = k_pool.shape[2]
+    o = torch.empty(head_dim, device=q.device, dtype=torch.float32)
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    paged_decode_kernel[(1,)](
+        q, k_pool, v_pool, o, block_table, seq_len, scale, kv_head,
+        k_pool.stride(0), k_pool.stride(1), k_pool.stride(2), k_pool.stride(3),
+        BLOCK_SIZE=BLK, BLOCK_D=BLOCK_D, HEAD_DIM=head_dim,
+    )
+    return o
+
+
+def test_paged_decode():
+    torch.manual_seed(0)
+    seq_len, head_dim, BLK = 200, 128, 16
+    n_seq_blocks = (seq_len + BLK - 1) // BLK
+    num_blocks = n_seq_blocks + 5            # pool slack
+    scale = 1.0 / (head_dim ** 0.5)
+
+    q = torch.randn(head_dim, device="cuda", dtype=torch.float32)
+    k = torch.randn(seq_len, head_dim, device="cuda", dtype=torch.float32)
+    v = torch.randn(seq_len, head_dim, device="cuda", dtype=torch.float32)
+
+    # scatter the sequence into SHUFFLED physical blocks (proves non-contiguity)
+    k_pool = torch.zeros(num_blocks, 1, BLK, head_dim, device="cuda", dtype=torch.float32)
+    v_pool = torch.zeros_like(k_pool)
+    phys = torch.randperm(num_blocks, device="cuda")[:n_seq_blocks].to(torch.int32)
+    for t in range(seq_len):
+        b, off = phys[t // BLK].item(), t % BLK
+        k_pool[b, 0, off, :] = k[t]
+        v_pool[b, 0, off, :] = v[t]
+
+    scores = (k @ q) * scale
+    ref = torch.softmax(scores, dim=0) @ v
+    got = paged_decode(q, k_pool, v_pool, phys, seq_len, kv_head=0, scale=scale)
+    err = (got - ref).abs().max().item()
+    assert torch.allclose(got, ref, atol=1e-3), f"mismatch, max abs err {err}"
+    print(f"K2 OK — paged-decode attention matches torch over shuffled blocks (max abs err {err:.2e}).")
+
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
@@ -137,3 +228,4 @@ if __name__ == "__main__":
     else:
         test_softmax()
         test_flash_decode()
+        test_paged_decode()

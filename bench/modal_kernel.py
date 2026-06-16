@@ -27,7 +27,8 @@ def run():
     print(f"gpu={torch.cuda.get_device_name(0)}  torch={torch.__version__}  triton={triton.__version__}")
     pa.test_softmax()         # K0
     pa.test_flash_decode()    # K1
-    # K2/K3 checks get appended here as the ladder progresses.
+    pa.test_paged_decode()    # K2
+    # K3 check gets appended here.
 
 
 @app.local_entrypoint()
