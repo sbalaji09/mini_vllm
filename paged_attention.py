@@ -267,7 +267,7 @@ def paged_decode_batched_kernel(q_ptr, k_pool_ptr, v_pool_ptr, o_ptr, bt_ptr, se
                     mask=mask_t[:, None] & mask_d[None, :], other=0.0)
 
         # computes attention scores for this query against the current key block
-        scores = tl.sum(k * q[None, :], axis=1) * scale
+        scores = tl.sum(k.to(tl.float32) * q[None, :].to(tl.float32), axis=1) * scale
         scores = tl.where(mask_t, scores, -float("inf"))
         m_new = tl.maximum(m, tl.max(scores, axis=0))
         p = tl.exp(scores - m_new)
