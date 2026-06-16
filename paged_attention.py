@@ -1,32 +1,37 @@
 """
-standalone kernel for PagedAttention
+small Triton kernel file that implements a custom-row wise softmax kernel on GPU
 """
 import torch
 import triton
 import triton.language as tl
 
 
-# ---------------- K0: row softmax ----------------
-# One program per row. Teaches: program_id, tl.arange offsets, masked load/store,
-# and the reductions (tl.max / tl.sum) that online softmax is built from.
-
+# defines the GPU kernel
 @triton.jit
 def softmax_kernel(x_ptr, out_ptr, n_cols, row_stride, BLOCK: tl.constexpr):
+    # gets that this Triton program is responsible for and creates column offsets from 0 to BLOCK-1
     row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK)          # tile of column offsets [0, BLOCK)
-    mask = cols < n_cols                # bounds: BLOCK is padded up to a power of 2
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+
+    # computes the input and output memory addresses for the start of this row
     row_start = x_ptr + row * row_stride
     out_start = out_ptr + row * row_stride
 
+    # loads one row tile and subtracts the row mask for numerical stability
     x = tl.load(row_start + cols, mask=mask, other=float("-inf"))
     x = x - tl.max(x, axis=0)
     e = tl.exp(x)
+
+    # normalizes the row sum to produce softmax probabilities
     y = e / tl.sum(e, axis=0)
+
+    # writes the softmax result back to output for valid coumns only
     tl.store(out_start + cols, y, mask=mask)
 
-
+# python wrapper around the Triton kernel
 def triton_softmax(x: torch.Tensor) -> torch.Tensor:
-    assert x.is_cuda and x.ndim == 2
+    assert x.is_cuda and x.ndim == 2 # requires a CUDA 2D tensor
     n_rows, n_cols = x.shape
     out = torch.empty_like(x)
     BLOCK = triton.next_power_of_2(n_cols)
@@ -34,7 +39,7 @@ def triton_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# ---------------- correctness harness (glue) ----------------
+# ---------------- correctness harness ----------------
 
 def test_softmax():
     torch.manual_seed(0)
