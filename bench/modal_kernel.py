@@ -25,10 +25,11 @@ def run():
     import paged_attention as pa
 
     print(f"gpu={torch.cuda.get_device_name(0)}  torch={torch.__version__}  triton={triton.__version__}")
-    pa.test_softmax()         # K0
-    pa.test_flash_decode()    # K1
-    pa.test_paged_decode()    # K2
-    # K3 check gets appended here.
+    pa.test_softmax()             # K0
+    pa.test_flash_decode()        # K1
+    pa.test_paged_decode()        # K2
+    pa.test_paged_batched()       # K3 correctness
+    pa.bench_kernel_vs_gather()   # K3 microbench — the loop-closing number
 
 
 @app.local_entrypoint()

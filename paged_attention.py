@@ -222,6 +222,171 @@ def test_paged_decode():
     print(f"K2 OK — paged-decode attention matches torch over shuffled blocks (max abs err {err:.2e}).")
 
 
+# ---------------- K3: BATCHED + GQA paged decode ----------------
+# grid = (R sequences, n_q_heads). One program per (sequence, query head).
+# Same paged read + online softmax as K2; only the indexing generalizes.
+
+@triton.jit
+def paged_decode_batched_kernel(q_ptr, k_pool_ptr, v_pool_ptr, o_ptr, bt_ptr, seqlen_ptr,
+                                scale, group,
+                                stride_qr, stride_qh, stride_qd,    # Q [R, n_q_heads, head_dim]
+                                stride_or, stride_oh, stride_od,    # O [R, n_q_heads, head_dim]
+                                stride_btr,                         # block_tables [R, max_blocks] row stride
+                                stride_blk, stride_h, stride_t, stride_d,   # pool strides
+                                BLOCK_SIZE: tl.constexpr, BLOCK_D: tl.constexpr, HEAD_DIM: tl.constexpr):
+    pid_r = tl.program_id(0)        # which sequence
+    pid_h = tl.program_id(1)        # which query head
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < HEAD_DIM
+
+    # TODO (yours) — the batched/GQA indexing (everything else below is K2 verbatim):
+    #   kv_head = pid_h // group                                  # GQA: many q-heads -> one kv-head
+    #   q = tl.load(q_ptr + pid_r*stride_qr + pid_h*stride_qh + offs_d*stride_qd,
+    #               mask=mask_d, other=0.0)
+    #   seq_len = tl.load(seqlen_ptr + pid_r)                     # this sequence's length (scalar)
+    #   bt_row  = bt_ptr + pid_r * stride_btr                     # this sequence's block-table row
+    kv_head = pid_h // group
+    q = tl.load(q_ptr + pid_r*stride_qr + pid_h*stride_qh + offs_d*stride_qd,
+                mask=mask_d, other=0.0)
+    seq_len = tl.load(seqlen_ptr + pid_r)
+    bt_row = bt_ptr + pid_r * stride_btr
+
+    m = -float("inf")
+    l = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    n_blocks = tl.cdiv(seq_len, BLOCK_SIZE)
+    for j in range(0, n_blocks):
+        phys = tl.load(bt_row + j)
+        offs_t = tl.arange(0, BLOCK_SIZE)
+        tok = j * BLOCK_SIZE + offs_t
+        mask_t = tok < seq_len
+
+        base_k = k_pool_ptr + phys * stride_blk + kv_head * stride_h
+        k = tl.load(base_k + offs_t[:, None] * stride_t + offs_d[None, :] * stride_d,
+                    mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+        base_v = v_pool_ptr + phys * stride_blk + kv_head * stride_h
+        v = tl.load(base_v + offs_t[:, None] * stride_t + offs_d[None, :] * stride_d,
+                    mask=mask_t[:, None] & mask_d[None, :], other=0.0)
+
+        scores = tl.sum(k * q[None, :], axis=1) * scale
+        scores = tl.where(mask_t, scores, -float("inf"))
+        m_new = tl.maximum(m, tl.max(scores, axis=0))
+        p = tl.exp(scores - m_new)
+        corr = tl.exp(m - m_new)
+        l = l * corr + tl.sum(p, axis=0)
+        acc = acc * corr + tl.sum(p[:, None] * v, axis=0)
+        m = m_new
+
+    o = acc / l
+    # TODO (yours): store O at (pid_r, pid_h):
+    #   tl.store(o_ptr + pid_r*stride_or + pid_h*stride_oh + offs_d*stride_od, o, mask=mask_d)
+    tl.store(o_ptr + pid_r*stride_or + pid_h*stride_oh + offs_d*stride_od, o, mask=mask_d)
+
+
+def paged_decode_batched(q, k_pool, v_pool, block_tables, seq_lens, n_kv_heads, scale):
+    R, n_q_heads, head_dim = q.shape
+    group = n_q_heads // n_kv_heads
+    BLK = k_pool.shape[2]
+    o = torch.empty_like(q)
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    paged_decode_batched_kernel[(R, n_q_heads)](
+        q, k_pool, v_pool, o, block_tables, seq_lens, scale, group,
+        q.stride(0), q.stride(1), q.stride(2),
+        o.stride(0), o.stride(1), o.stride(2),
+        block_tables.stride(0),
+        k_pool.stride(0), k_pool.stride(1), k_pool.stride(2), k_pool.stride(3),
+        BLOCK_SIZE=BLK, BLOCK_D=BLOCK_D, HEAD_DIM=head_dim,
+    )
+    return o
+
+
+# ---- glue: build a paged batch, and the gather+attend baseline (what the kernel replaces) ----
+
+def _build_batch(R, n_kv_heads, head_dim, BLK=16, max_len=512, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    seq_lens = torch.randint(20, max_len + 1, (R,), device="cuda", generator=g, dtype=torch.int32)
+    max_blocks = (max_len + BLK - 1) // BLK
+    total = int(((seq_lens + BLK - 1) // BLK).sum())
+    num_blocks = total + 8
+    k_pool = torch.randn(num_blocks, n_kv_heads, BLK, head_dim, device="cuda", generator=g)
+    v_pool = torch.randn(num_blocks, n_kv_heads, BLK, head_dim, device="cuda", generator=g)
+    # assign each sequence a shuffled, non-overlapping set of physical blocks
+    perm = torch.randperm(num_blocks, device="cuda", generator=g)
+    block_tables = torch.zeros(R, max_blocks, device="cuda", dtype=torch.int32)
+    cur = 0
+    for r in range(R):
+        nb = int((seq_lens[r] + BLK - 1) // BLK)
+        block_tables[r, :nb] = perm[cur:cur + nb].to(torch.int32)
+        cur += nb
+    return k_pool, v_pool, block_tables, seq_lens
+
+
+def gather_attend(q, k_pool, v_pool, block_tables, seq_lens, n_kv_heads, scale, max_len):
+    # the Phase-2B approach: gather scattered blocks -> contiguous, then attend.
+    # This is what the kernel makes unnecessary.
+    R, n_q_heads, head_dim = q.shape
+    group = n_q_heads // n_kv_heads
+    BLK = k_pool.shape[2]
+    Kc = torch.zeros(R, n_kv_heads, max_len, head_dim, device=q.device, dtype=q.dtype)
+    Vc = torch.zeros_like(Kc)
+    for r in range(R):
+        L = int(seq_lens[r]); nb = (L + BLK - 1) // BLK
+        ids = block_tables[r, :nb]
+        Kc[r, :, :L, :] = k_pool[ids].permute(1, 0, 2, 3).reshape(n_kv_heads, -1, head_dim)[:, :L, :]
+        Vc[r, :, :L, :] = v_pool[ids].permute(1, 0, 2, 3).reshape(n_kv_heads, -1, head_dim)[:, :L, :]
+    Kc = Kc.repeat_interleave(group, dim=1)            # GQA expand -> [R, n_q_heads, max_len, D]
+    Vc = Vc.repeat_interleave(group, dim=1)
+    scores = torch.einsum("rhd,rhld->rhl", q, Kc) * scale
+    valid = torch.arange(max_len, device=q.device)[None, :] < seq_lens[:, None]
+    scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+    p = torch.softmax(scores, dim=-1)
+    return torch.einsum("rhl,rhld->rhd", p, Vc)
+
+
+def test_paged_batched():
+    torch.manual_seed(0)
+    R, n_q_heads, n_kv_heads, head_dim, max_len = 8, 12, 2, 128, 300
+    scale = 1.0 / (head_dim ** 0.5)
+    k_pool, v_pool, block_tables, seq_lens = _build_batch(R, n_kv_heads, head_dim, max_len=max_len)
+    q = torch.randn(R, n_q_heads, head_dim, device="cuda", dtype=torch.float32)
+    ref = gather_attend(q, k_pool, v_pool, block_tables, seq_lens, n_kv_heads, scale, max_len)
+    got = paged_decode_batched(q, k_pool, v_pool, block_tables, seq_lens, n_kv_heads, scale)
+    err = (got - ref).abs().max().item()
+    assert torch.allclose(got, ref, atol=1e-3), f"mismatch, max abs err {err}"
+    print(f"K3 OK — batched+GQA paged attention matches gather reference (max abs err {err:.2e}).")
+
+
+def bench_kernel_vs_gather():
+    import time
+    R, n_q_heads, n_kv_heads, head_dim, max_len = 64, 12, 2, 128, 512
+    scale = 1.0 / (head_dim ** 0.5)
+    k_pool, v_pool, block_tables, seq_lens = _build_batch(R, n_kv_heads, head_dim, max_len=max_len, seed=1)
+    q = torch.randn(R, n_q_heads, head_dim, device="cuda", dtype=torch.float32)
+
+    def run_kernel():
+        return paged_decode_batched(q, k_pool, v_pool, block_tables, seq_lens, n_kv_heads, scale)
+
+    def run_gather():
+        return gather_attend(q, k_pool, v_pool, block_tables, seq_lens, n_kv_heads, scale, max_len)
+
+    for _ in range(5):           # warmup (compile + autotune)
+        run_kernel(); run_gather()
+    torch.cuda.synchronize()
+
+    def timed(fn, iters=50):
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / iters * 1e3   # ms/step
+
+    tk, tg = timed(run_kernel), timed(run_gather)
+    print(f"K3 microbench (R={R}): kernel {tk:.3f} ms/step | gather+attend {tg:.3f} ms/step "
+          f"| kernel {tg / tk:.2f}x faster (no gather copy)")
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("Triton needs a CUDA GPU — run this on Modal: modal run bench/modal_kernel.py")
@@ -229,3 +394,5 @@ if __name__ == "__main__":
         test_softmax()
         test_flash_decode()
         test_paged_decode()
+        test_paged_batched()
+        bench_kernel_vs_gather()
