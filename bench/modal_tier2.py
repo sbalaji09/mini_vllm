@@ -25,7 +25,8 @@ def run():
     sys.path.insert(0, "/root")
     import paged_kernel_engine as pke
     print(f"gpu={torch.cuda.get_device_name(0)}")
-    pke.test_decode_step()       # T2a
+    pke.test_decode_step()         # T2a — single step matches the model
+    pke.test_generate_matches()    # T2b — full generation through the kernel
     hf_cache.commit()
 
 

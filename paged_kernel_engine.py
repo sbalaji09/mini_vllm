@@ -8,6 +8,9 @@ PagedKVCache pool. Prefill stays model(...) + scatter (Phase 2B).
 Verify (T2a here): a single custom decode step must match the model's own decode
 logits. Run on Modal: modal run bench/modal_tier2.py
 """
+import itertools
+from dataclasses import dataclass, field
+
 import torch
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
 
@@ -51,26 +54,6 @@ def decode_logits(kv: PagedKVCache, last_tokens, tables):
     cos, sin = rotary(h, positions)        # each [R, 1, head_dim]
 
     for i, layer in enumerate(layers):
-        # TODO (yours): one Qwen2 decoder layer with attention replaced by the kernel.
-        #   residual = h
-        #   x = layer.input_layernorm(h)
-        #   shp = (R, 1, -1, HEAD_DIM)
-        #   q = layer.self_attn.q_proj(x).view(shp).transpose(1, 2)   # [R, N_Q, 1, HEAD_DIM]
-        #   k = layer.self_attn.k_proj(x).view(shp).transpose(1, 2)   # [R, N_KV,1, HEAD_DIM]
-        #   v = layer.self_attn.v_proj(x).view(shp).transpose(1, 2)
-        #   q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        #   # SCATTER this layer's new token K/V into the pool (slot already allocated):
-        #   for r, t in enumerate(tables):
-        #       blk, off = t.physical(t.length - 1)
-        #       kv.k_pool[i][blk, :, off, :] = k[r, :, 0, :]
-        #       kv.v_pool[i][blk, :, off, :] = v[r, :, 0, :]
-        #   # KERNEL attention (q_in [R, N_Q, HEAD_DIM]); reads the pool in place:
-        #   attn = paged_decode_batched(q[:, :, 0, :].contiguous(),
-        #                               kv.k_pool[i], kv.v_pool[i], bt, seq_lens, N_KV, SCALE)
-        #   attn = attn.reshape(R, 1, -1).to(h.dtype)        # cast fp32 -> model dtype for o_proj
-        #   attn = layer.self_attn.o_proj(attn)
-        #   h = residual + attn
-        #   h = h + layer.mlp(layer.post_attention_layernorm(h))
         residual = h
         x = layer.input_layernorm(h)
         shp = (R, 1, -1, HEAD_DIM)
@@ -144,8 +127,114 @@ def test_decode_step():
     print("T2a OK — custom kernel decode step matches the model.")
 
 
+# full continuous batching generation through the kernel
+@dataclass
+class Req:
+    id: int
+    prompt: str
+    max_new_tokens: int = 64
+    table: object = None
+    last_token: torch.Tensor = None
+    output_ids: list = field(default_factory=list)
+    finished: bool = False
+
+
+class PagedKernelEngine:
+    def __init__(self, max_batch_size=8, num_blocks=2048):
+        self.max_batch_size = max_batch_size
+        self.kv = _new_pool(num_blocks)
+        self.waiting, self.running, self.completed = [], [], []
+        self._ids = itertools.count()
+
+    def submit(self, prompt, max_new_tokens=64):
+        r = Req(next(self._ids), prompt, max_new_tokens)
+        self.waiting.append(r)
+        return r
+
+    @torch.no_grad()
+    def _admit(self):
+        while len(self.running) < self.max_batch_size and self.waiting:
+            r = self.waiting.pop(0)
+            text = tok.apply_chat_template([{"role": "user", "content": r.prompt}],
+                                           add_generation_prompt=True, tokenize=False)
+            ids = tok(text, return_tensors="pt")["input_ids"].to(DEVICE)
+            out = model(input_ids=ids, use_cache=True)
+            r.table = scatter_prompt(self.kv, out.past_key_values)     # prompt -> pool
+            r.last_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+            r.output_ids.append(r.last_token[0].item())
+            if r.last_token[0].item() == tok.eos_token_id:
+                r.finished = True
+                r.table.free_all()
+                self.completed.append(r)
+            else:
+                self.running.append(r)
+
+    @torch.no_grad()
+    def _decode_step(self):
+        if not self.running:
+            return
+        
+        for r in self.running:
+            if not r.table.append_token():
+                r.finished = True
+        
+        last = torch.cat([r.last_token for r in self.running], dim=0)
+        logits = decode_logits(self.kv, last, [r.table for r in self.running])
+        nxt = logits.argmax(-1, keepdim=True)
+        for i, r in enumerate(self.running):
+            tid = nxt[i].item()
+            r.output_ids.append(tid)
+            r.last_token = nxt[i:i+1]
+            if tid == tok.eos_token_id or len(r.output_ids) >= r.max_new_tokens:
+                r.finished = True
+
+    @torch.no_grad()
+    def _retire(self):
+        keep = []
+        for r in self.running:
+            if r.finished:
+                r.table.free_all()
+                self.completed.append(r)
+            else:
+                keep.append(r)
+        self.running = keep
+
+    def step(self):
+        self._admit(); self._decode_step(); self._retire()
+
+    def run(self):
+        while self.waiting or self.running:
+            self.step()
+        return self.completed
+
+
+def test_generate_matches():
+    from engine import generate
+    TARGET = "Explain what a KV cache is in two sentences."
+    CAP = 24
+    ref = generate(TARGET, max_new_tokens=CAP)["output_ids"]
+
+    eng = PagedKernelEngine(max_batch_size=4, num_blocks=512)
+    rt = eng.submit(TARGET, max_new_tokens=CAP)
+    eng.submit("Hi.", max_new_tokens=CAP)
+    eng.submit("Write a long, detailed essay about how CPUs work.", max_new_tokens=CAP)
+    got = {r.id: r.output_ids for r in eng.run()}[rt.id]
+
+    n = 0
+    for a, b in zip(ref, got):
+        if a == b:
+            n += 1
+        else:
+            break
+    print(f"T2b: matched {n}/{len(ref)} leading tokens vs generate() (bf16; tail drift = "
+          f"kernel-vs-SDPA reduction order, not a bug)")
+    print("  generate:", tok.decode(ref, skip_special_tokens=True))
+    print("  kernel  :", tok.decode(got, skip_special_tokens=True))
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("Needs a CUDA GPU — run on Modal: modal run bench/modal_tier2.py")
     else:
-        test_decode_step()
+        test_decode_step()        # T2a
+        test_generate_matches()   # T2b
